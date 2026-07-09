@@ -31,7 +31,11 @@ juce_add_plugin(GrainReverb2
     # zero-filled) because Info.plist lacks NSMicrophoneUsageDescription.
     # This generates that key so the OS actually asks for permission.
     MICROPHONE_PERMISSION_ENABLED TRUE
-    MICROPHONE_PERMISSION_TEXT "GrainReverb2 needs microphone input to process live audio through the granular reverb.")
+    MICROPHONE_PERMISSION_TEXT "GrainReverb2 needs microphone input to process live audio through the granular reverb."
+    # Copies the built VST3 into ~/Library/Audio/Plug-Ins/VST3 after every
+    # build (Debug or Release) -- no more manual cp step before rescanning
+    # in Ableton.
+    COPY_PLUGIN_AFTER_BUILD TRUE)
 
 # juce_generate_juce_header() would create a monolithic JuceHeader.h (the old
 # Projucer style). We skip it and #include the specific juce_* module headers
