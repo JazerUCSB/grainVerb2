@@ -5,17 +5,18 @@
 #include "PluginProcessor.h"
 #include "VisualizerLayout.h"
 
-// Raw scrolling view of one channel of the engine's del1 circular buffer --
-// a diagnostic view of what's literally stored in the buffer, not a claim
-// about output timing (see the RT60 discussion: a dedicated
-// OutputDecayVisualizer, scaled by RT60, is the right place for the
-// breakpoint curves to map onto perceived decay timing -- that's a
-// separate component, not this one).
+// Raw scrolling view of BOTH channels of the engine's del1 circular buffer,
+// stacked L-on-top/R-on-bottom -- a diagnostic view of what's literally
+// stored in the buffer, not a claim about output timing (see the RT60
+// discussion: a dedicated OutputDecayVisualizer, scaled by RT60, is the
+// right place for the breakpoint curves to map onto perceived decay
+// timing -- that's a separate component, not this one).
 //
-// Which channel (L/R) is chosen by setVoiceChannel() (defaults to Left).
 // Now that stereo width comes from per-grain panning inside a single
-// merged engine (not two separate mono engines), "channel" here just means
-// "which of del1L/del1R to look at."
+// merged engine (not two separate mono engines), showing both del1L and
+// del1R at once (rather than toggling between them) is what actually shows
+// the stereo picture -- there's no single "which channel" that's more
+// informative than the other.
 //
 // Orientation matches the PDF's spec exactly: newest material (the write
 // head) is at the left edge; the right edge is the oldest material a grain
@@ -30,13 +31,8 @@ class CircularBufferVisualizer : public juce::Component,
                                   private juce::Timer
 {
 public:
-    enum class VoiceChannel { Left, Right };
-
     explicit CircularBufferVisualizer (GrainReverb2AudioProcessor& processorToUse);
     ~CircularBufferVisualizer() override;
-
-    void setVoiceChannel (VoiceChannel ch) { voiceChannel = ch; repaint(); }
-    VoiceChannel getVoiceChannel() const { return voiceChannel; }
 
     void paint (juce::Graphics&) override;
 
@@ -44,7 +40,6 @@ private:
     void timerCallback() override;
 
     GrainReverb2AudioProcessor& processor;
-    VoiceChannel voiceChannel = VoiceChannel::Left;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CircularBufferVisualizer)
 };

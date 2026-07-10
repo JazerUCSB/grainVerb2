@@ -1,5 +1,36 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <cmath>
+
+namespace
+{
+    // Display-only text conversion for the dial readouts -- the underlying
+    // parameter value keeps full float precision, only how it's shown (in
+    // our own UI, and any host generic editor) changes. This has to live on
+    // the PARAMETER (via AudioParameterFloatAttributes), not the Slider:
+    // AudioProcessorValueTreeState::SliderAttachment wires its own
+    // Slider::textFromValueFunction to call straight through to
+    // RangedAudioParameter::getText(), so anything set directly on the
+    // Slider gets silently routed around -- this is the one place that
+    // actually sticks.
+    juce::AudioParameterFloatAttributes msUnitAttrs()
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int) { return juce::String (v, 3) + " ms"; });
+    }
+
+    juce::AudioParameterFloatAttributes plain3DecimalAttrs()
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int) { return juce::String (v, 3); });
+    }
+
+    juce::AudioParameterFloatAttributes sampsUnitAttrs()
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int) { return juce::String ((juce::int64) std::round (v)) + " samps"; });
+    }
+}
 
 GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
     : AudioProcessor (BusesProperties()
@@ -37,31 +68,31 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     // processBlock.
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::fadeSamps, 1 }, "Fade (samples)",
-        Range { 3.0f, 4800.0f }, 200.0f));
+        Range { 3.0f, 4800.0f }, 200.0f, sampsUnitAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::meanWindowMs, 1 }, "Grain Size (ms)",
-        Range { 1.0f, 3000.0f }, 200.0f));
+        Range { 1.0f, 3000.0f }, 200.0f, msUnitAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::windowRangeMs, 1 }, "Grain Size Variance (ms)",
-        Range { 1.0f, 3000.0f }, 50.0f));
+        Range { 1.0f, 3000.0f }, 50.0f, msUnitAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::bufferLenMs, 1 }, "Buffer Length (ms)",
-        Range { 500.0f, 6000.0f }, 4000.0f));
+        Range { 500.0f, 6000.0f }, 4000.0f, msUnitAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::feedback, 1 }, "Feedback",
-        Range { 0.0f, 0.999f }, 0.5f));
+        Range { 0.0f, 0.999f }, 0.5f, plain3DecimalAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::readScatter, 1 }, "Read Scatter",
-        Range { 0.1f, 1.0f }, 0.9f));
+        Range { 0.1f, 1.0f }, 1.0f, plain3DecimalAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::jitter, 1 }, "Rate Jitter",
-        Range { 0.0f, 0.75f }, 0.0f));
+        Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::dispersion, 1 }, "Stereo Dispersion",
-        Range { 0.0f, 1.0f }, 1.0f));
+        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::mix, 1 }, "Mix",
-        Range { 0.0f, 1.0f }, 1.0f));
+        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
 
     return { params.begin(), params.end() };
 }

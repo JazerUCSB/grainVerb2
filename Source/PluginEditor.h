@@ -22,10 +22,11 @@ private:
 
     juce::TextButton cutoffButton { "Cutoff" }, qButton { "Q" }, tailButton { "Tail" };
 
-    // Which engine's buffer the visualizer shows -- separate from dispersion
-    // routing, since with dispersion > 0 "voiceL" isn't reliably "the left
-    // input channel" (see CircularBufferVisualizer::setVoiceChannel).
-    juce::TextButton voiceChannelButton { "Showing: L" };
+    // On-demand RT60 estimate (cheap closed-form, PDF Section 2.6) -- not a
+    // live/continuous measurement, just a snapshot computed from the
+    // current params when clicked, shown in rt60Readout.
+    juce::TextButton rt60Button { "Calc RT60" };
+    juce::Label rt60Readout;
 
     // bufferVisualizer and breakpointEditor are given IDENTICAL bounds in
     // resized(). breakpointEditor is added second (frontmost, both for

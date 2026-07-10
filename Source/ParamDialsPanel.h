@@ -30,7 +30,10 @@ private:
     GrainReverb2AudioProcessor& processor;
     juce::OwnedArray<Dial> dials;
 
-    static constexpr int columns = 4;
+    // 3x3 for 9 dials -- fewer, wider columns than before so each dial is
+    // noticeably bigger (a rotary slider's diameter is bounded by the
+    // smaller of its cell's width/height).
+    static constexpr int columns = 3;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ParamDialsPanel)
 };

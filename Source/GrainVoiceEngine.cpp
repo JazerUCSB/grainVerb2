@@ -58,6 +58,18 @@ int GrainVoiceEngine::chooseWriteChannel (int readChannel, double dispersion)
     return flip ? (1 - readChannel) : readChannel;
 }
 
+double GrainVoiceEngine::clampReadAgainstWriteHead (double rawRead, double dur, double rate, double spanLen)
+{
+    const double wantedMargin = dur * std::abs (rate - 1.0);
+    // Cap the margin at just under half of spanLen so [margin, spanLen-margin]
+    // can never invert -- an extreme combination (very long grain, high
+    // jitter, short buffer) could otherwise ask for more margin than the
+    // buffer has. In that extreme case every grain collapses toward the
+    // buffer's centre (less diversity) rather than risking a collision.
+    const double margin = juce::jlimit (0.0, juce::jmax (0.0, spanLen * 0.5 - 1.0), wantedMargin);
+    return juce::jlimit (margin, juce::jmax (margin, spanLen - margin), rawRead);
+}
+
 void GrainVoiceEngine::prepare (double newSampleRate, const GrainReverbSharedState& shared)
 {
     sampleRate = newSampleRate;
@@ -93,9 +105,10 @@ void GrainVoiceEngine::seedGrains (const GrainReverbSharedState& shared)
 
     for (auto& g : grains1)
     {
-        g.read = juce::jmax (5.0, std::abs (noise() * readSpan));
         g.rate = 1.0 + noise() * p.jitter;
         g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
+        const double rawRead1 = juce::jmax (5.0, std::abs (noise() * readSpan));
+        g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len);
         g.age  = std::abs (noise() * del1Len);
         g.sign = noise() >= 0.0 ? 1.0 : -1.0;
         g.readChannel = (noise() >= 0.0) ? 0 : 1;
@@ -112,9 +125,10 @@ void GrainVoiceEngine::seedGrains (const GrainReverbSharedState& shared)
 
     for (auto& g : grains2)
     {
-        g.read = juce::jmax (5.0, std::abs (noise() * del2Len));
         g.rate = 1.0 + noise() * p.jitter;
         g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
+        const double rawRead2 = juce::jmax (5.0, std::abs (noise() * del2Len));
+        g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len);
         g.age  = std::abs (noise() * del2Len);
         g.sign = noise() >= 0.0 ? 1.0 : -1.0;
         g.readChannel = (noise() >= 0.0) ? 0 : 1;
@@ -191,8 +205,23 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
         const double trap = juce::jmin (rampUp, rampDwn);
         au *= trap;
 
-        // tail: continuous lookup on the grain's CURRENT read (same dn as cutoff)
-        const double dnT = juce::jlimit (0.0, 1.0, g.read / readSpan);
+        // tail: continuous lookup on the grain's CURRENT distance behind the
+        // write head. Deliberately NOT g.read/readSpan -- g.read increments
+        // by a flat 1.0 every sample (see below) purely as bookkeeping to
+        // keep `pos` fixed; it does NOT track "how far behind the write
+        // head is this grain currently reading," which is cnt1 - readPos
+        // (constant at rate=1, drifting by (1-rate) per sample otherwise).
+        // Using g.read directly here meant that for any grain spawned with
+        // read close to del1Len -- likely exactly as readScatter -> 1, since
+        // readSpan approaches del1Len -- g.read would wrap from ~del1Len
+        // back to ~0 within a handful of samples of spawning, snapping dnT
+        // from ~1.0 (heavily tail-attenuated) to ~0.0 (full volume) in a
+        // single sample: a sudden, loud, still-heavily-lowpassed (frozen
+        // coefficients don't update mid-life) blast of "old" content --
+        // exactly the distorted echo, present at ANY jitter setting since
+        // it's not a rate-drift bug, just worse at high scatter.
+        const double trueGap = wrapValue (cnt1 - readPos, 0.0, del1Len);
+        const double dnT = juce::jlimit (0.0, 1.0, trueGap / readSpan);
         const int idxT = juce::jlimit (0, kNumTableSlots - 1,
                                         (int) std::round (dnT * (double) (kNumTableSlots - 1)));
         au *= curves->tail[(size_t) idxT];
@@ -216,9 +245,10 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
         if (g.age > g.dur)
         {
             g.age = 0.0;
-            g.read = juce::jmax (5.0, std::abs (noise() * readSpan));
             g.rate = 1.0 + noise() * p.jitter;
             g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
+            const double rawRead1 = juce::jmax (5.0, std::abs (noise() * readSpan));
+            g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len);
             g.sign = noise() >= 0.0 ? 1.0 : -1.0;
             g.readChannel = (noise() >= 0.0) ? 0 : 1;
             g.writeChannel = chooseWriteChannel (g.readChannel, p.dispersion);
@@ -276,9 +306,10 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
         if (g.age > g.dur)
         {
             g.age = 0.0;
-            g.read = juce::jmax (5.0, std::abs (noise() * del2Len));
             g.rate = 1.0 + noise() * p.jitter;
             g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
+            const double rawRead2 = juce::jmax (5.0, std::abs (noise() * del2Len));
+            g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len);
             g.sign = noise() >= 0.0 ? 1.0 : -1.0;
             g.readChannel = (noise() >= 0.0) ? 0 : 1;
             g.writeChannel = chooseWriteChannel (g.readChannel, p.dispersion);

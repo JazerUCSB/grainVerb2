@@ -106,6 +106,23 @@ private:
     static double peekLinear (const std::vector<double>& buf, double pos);
     static void pokeWrite (std::vector<double>& buf, double pos, double val);
 
+    // A grain's read anchor (pos = writeHead - read, at spawn) does NOT
+    // drift with the write head, but its actual read pointer
+    // (pos + age*rate) does -- catching up to the write head if rate>1,
+    // or falling further behind (toward the OTHER end, spanLen) if
+    // rate<1. If `read` starts too close to either 0 or spanLen, the
+    // write head can catch/lap the grain mid-life, causing a sudden jump
+    // from old buffer content to freshly-written (or stale, lapped)
+    // content -- an audible glitch. This reserves a margin, sized to this
+    // grain's own worst-case drift over its lifetime (dur * |rate-1|), on
+    // BOTH ends so the write head can never reach the grain's read
+    // pointer before it respawns. Must be called with dur/rate already
+    // assigned (margin depends on both), and spanLen = del1Len for Bank 1
+    // or del2Len for Bank 2 -- NOT readSpan, since the wrap boundary is
+    // the buffer's active length, not the (possibly smaller) scatter-
+    // limited draw range.
+    static double clampReadAgainstWriteHead (double rawRead, double dur, double rate, double spanLen);
+
     // Flips away from readChannel with probability dispersion/2 -- see the
     // Grain::writeChannel comment for why that specific formula gives
     // "always matches read channel" at dispersion=0 and "fair coin flip"

@@ -3,12 +3,16 @@
 ParamDialsPanel::ParamDialsPanel (GrainReverb2AudioProcessor& processorToUse)
     : processor (processorToUse)
 {
-    addDial (ParamID::fadeSamps, "Fade");
-    addDial (ParamID::meanWindowMs, "Grain Size");
-    addDial (ParamID::windowRangeMs, "Grain Var");
-    addDial (ParamID::bufferLenMs, "Buf Len");
+    // Row 1: Buffer Length, Feedback, Scatter. Row 2: Grain Size, Grain
+    // Variance, Grain Fade. Row 3: Jitter, Dispersion, Mix. Value-readout
+    // formatting (units, decimal places) lives on the parameter itself now
+    // (see PluginProcessor.cpp's createParameterLayout()) -- not here.
+    addDial (ParamID::bufferLenMs, "Buffer Length");
     addDial (ParamID::feedback, "Feedback");
     addDial (ParamID::readScatter, "Scatter");
+    addDial (ParamID::meanWindowMs, "Grain Size");
+    addDial (ParamID::windowRangeMs, "Grain Variance");
+    addDial (ParamID::fadeSamps, "Grain Fade");
     addDial (ParamID::jitter, "Jitter");
     addDial (ParamID::dispersion, "Dispersion");
     addDial (ParamID::mix, "Mix");
@@ -19,7 +23,8 @@ ParamDialsPanel::Dial& ParamDialsPanel::addDial (const juce::String& paramID, co
     auto* d = dials.add (new Dial());
 
     d->slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    d->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 56, 16);
+    // Wide enough to fit a unit suffix like "200.000 ms" without truncating.
+    d->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
     addAndMakeVisible (d->slider);
 
     d->label.setText (labelText, juce::dontSendNotification);
@@ -30,8 +35,11 @@ ParamDialsPanel::Dial& ParamDialsPanel::addDial (const juce::String& paramID, co
     // Binds the slider to the APVTS parameter bidirectionally: turning the
     // dial writes the parameter (host automation/undo/state-save all keep
     // working through APVTS same as if a DAW automated it), and automation
-    // moves the dial. Range/default come from the RangedAudioParameter
-    // itself -- no manual setRange() needed.
+    // moves the dial. Range/default/display-text come from the
+    // RangedAudioParameter itself -- no manual setRange() or
+    // textFromValueFunction needed (the latter would just get silently
+    // overridden by this attachment's own wiring to the parameter's
+    // getText() anyway).
     d->attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processor.apvts, paramID, d->slider);
 
@@ -53,7 +61,7 @@ void ParamDialsPanel::resized()
         const int col = i % columns;
         const int row = i / columns;
         auto cell = juce::Rectangle<int> (bounds.getX() + col * cellW, bounds.getY() + row * cellH, cellW, cellH)
-                        .reduced (6, 4);
+                        .reduced (4, 2);
         auto labelArea = cell.removeFromTop (16);
         dials[i]->label.setBounds (labelArea);
         dials[i]->slider.setBounds (cell);

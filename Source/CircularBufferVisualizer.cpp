@@ -21,7 +21,9 @@ namespace
 CircularBufferVisualizer::CircularBufferVisualizer (GrainReverb2AudioProcessor& processorToUse)
     : processor (processorToUse)
 {
-    startTimerHz (30);
+    // 24fps rather than 30 -- extra headroom now that this repaints both
+    // channels' worth of buffer-scan work instead of one.
+    startTimerHz (24);
 }
 
 CircularBufferVisualizer::~CircularBufferVisualizer()
@@ -39,16 +41,16 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     g.fillAll (juce::Colours::black);
 
     const auto& engineRef = processor.getEngine();
-    const int ch = (voiceChannel == VoiceChannel::Left) ? 0 : 1;
-    const auto& buf = engineRef.getDelayBuffer1 (ch);
+    const auto& bufL = engineRef.getDelayBuffer1 (0);
+    const auto& bufR = engineRef.getDelayBuffer1 (1);
     const double writeHead = engineRef.getWriteHead1();
     const double sampleRate = processor.getSampleRate();
     const auto& params = processor.getSharedState().params;
 
-    if (buf.empty() || sampleRate <= 0.0)
+    if (bufL.empty() || sampleRate <= 0.0)
         return;
 
-    const double del1Len = std::floor ((params.bufferLenMs / 6000.0) * (double) buf.size());
+    const double del1Len = std::floor ((params.bufferLenMs / 6000.0) * (double) bufL.size());
     const double readSpan = juce::jmax (1.0, params.readScatter * del1Len);
     const double maxSeconds = readSpan / sampleRate;
 
@@ -57,63 +59,106 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     // Left margin reserved here purely for alignment -- BreakpointEditor
     // draws its active curve's value labels into this same strip when
     // overlaid on top, so both components must reserve identical space.
-    bounds.removeFromLeft (kVisualizerLeftMargin);
+    // Also doubles as room for the L/R tags drawn per channel below.
+    auto leftMarginArea = bounds.removeFromLeft (kVisualizerLeftMargin);
     bounds.removeFromTop (kVisualizerTopMargin); // headroom so a max-value point isn't top-clipped
-    auto waveformArea = bounds.toFloat();
 
-    const int width = juce::jmax (1, (int) waveformArea.getWidth());
-    const float midY = waveformArea.getCentreY();
-    const float halfH = waveformArea.getHeight() * 0.5f;
+    // Stacked L (top) / R (bottom) instead of a toggle -- with per-grain
+    // panning inside one merged engine, neither channel alone shows the
+    // stereo picture; showing both at once does.
+    constexpr int kChannelGap = 4;
+    auto topArea = bounds.removeFromTop ((bounds.getHeight() - kChannelGap) / 2);
+    bounds.removeFromTop (kChannelGap);
+    auto bottomArea = bounds;
 
     // One column per pixel: downsample the [dn, dn+1px) span of the buffer
-    // to a min/max pair. This scans the whole readSpan once per repaint
-    // (~30fps, message thread) -- fine even at the largest readSpan
-    // (~265k samples at max buffer length/scatter), nowhere near the
-    // audio thread's per-sample budget.
-    g.setColour (juce::Colours::limegreen);
-    for (int x = 0; x < width; ++x)
+    // to a min/max pair. A full per-sample scan of readSpan was fine at
+    // single-channel scale, but drawing BOTH channels doubles that work on
+    // the message thread at 30fps -- the same class of bug that caused an
+    // earlier (reverted) visualizer to audibly starve the audio thread, just
+    // smaller. Fixed the same way: cap samples scanned per column so total
+    // work per repaint stays bounded regardless of how large readSpan gets,
+    // trading a little min/max precision at high zoom-out for headroom.
+    constexpr int kMaxSamplesPerColumn = 64;
+    auto drawChannel = [&] (const std::vector<double>& buf, juce::Rectangle<int> areaInt, const juce::String& tag)
     {
-        const double dn0 = (double) x / (double) width;
-        const double dn1 = (double) (x + 1) / (double) width;
-        const int i0 = (int) (dn0 * readSpan);
-        const int i1 = juce::jmax (i0 + 1, (int) (dn1 * readSpan));
+        auto area = areaInt.toFloat();
+        const int width = juce::jmax (1, (int) area.getWidth());
+        const float midY = area.getCentreY();
+        const float halfH = area.getHeight() * 0.5f;
 
-        double lo = 1.0, hi = -1.0;
-        for (int i = i0; i < i1; ++i)
+        g.setColour (juce::Colours::limegreen);
+        for (int x = 0; x < width; ++x)
         {
-            // Wrap using del1Len (the ACTIVE portion the write head cycles
-            // through), not buf.size() (the full 6s capacity). Those two
-            // only match when bufferLenMs is maxed at 6000 -- otherwise
-            // wrapping against buf.size() lands in the unused tail of the
-            // vector (always silent/stale) instead of correctly wrapping
-            // back to the start of the active region, which shows up as a
-            // visible seam/jump sweeping across the display as the write
-            // head cycles.
-            const double v = buf[wrapIndex (writeHead - (double) i, (size_t) del1Len)];
-            lo = juce::jmin (lo, v);
-            hi = juce::jmax (hi, v);
+            const double dn0 = (double) x / (double) width;
+            const double dn1 = (double) (x + 1) / (double) width;
+            const int i0 = (int) (dn0 * readSpan);
+            const int i1 = juce::jmax (i0 + 1, (int) (dn1 * readSpan));
+            const int span = i1 - i0;
+            const int step = juce::jmax (1, span / kMaxSamplesPerColumn);
+
+            double lo = 1.0, hi = -1.0;
+            for (int i = i0; i < i1; i += step)
+            {
+                // Wrap using del1Len (the ACTIVE portion the write head cycles
+                // through), not buf.size() (the full 6s capacity) -- see the
+                // original Step 3 fix for why.
+                const double v = buf[wrapIndex (writeHead - (double) i, (size_t) del1Len)];
+                lo = juce::jmin (lo, v);
+                hi = juce::jmax (hi, v);
+            }
+            if (lo > hi) { lo = 0.0; hi = 0.0; } // guard against a degenerate empty span
+
+            const float xPix = area.getX() + (float) x;
+            g.drawVerticalLine ((int) xPix, midY - (float) hi * halfH, midY - (float) lo * halfH);
         }
-        if (lo > hi) { lo = 0.0; hi = 0.0; } // guard against a degenerate empty span
 
-        const float xPix = waveformArea.getX() + (float) x;
-        g.drawVerticalLine ((int) xPix, midY - (float) hi * halfH, midY - (float) lo * halfH);
-    }
+        // Write-head marker at the left edge (dn = 0, newest material).
+        g.setColour (juce::Colours::orange.withAlpha (0.6f));
+        g.drawVerticalLine ((int) area.getX(), area.getY(), area.getBottom());
 
-    // Write-head marker at the left edge (dn = 0, newest material).
-    g.setColour (juce::Colours::orange.withAlpha (0.6f));
-    g.drawVerticalLine ((int) waveformArea.getX(), waveformArea.getY(), waveformArea.getBottom());
+        // Channel tag in the reserved left margin, vertically centred on
+        // this channel's own half.
+        g.setColour (juce::Colours::grey);
+        g.setFont (13.0f);
+        g.drawText (tag, juce::Rectangle<float> ((float) leftMarginArea.getX(), area.getY(),
+                                                  (float) leftMarginArea.getWidth() - 4.0f, area.getHeight()),
+                    juce::Justification::centred);
+    };
+
+    drawChannel (bufL, topArea, "L");
+    drawChannel (bufR, bottomArea, "R");
 
     // Seconds ruler: exact dn -> seconds-since-written conversion (see the
-    // class comment in the header for what this axis does and doesn't claim).
+    // class comment in the header for what this axis does and doesn't
+    // claim). Shared by both channels since they're drawn to the same
+    // x-mapping.
+    const auto rulerWaveformX = topArea.toFloat().getX();
+    const auto rulerWaveformWidth = topArea.toFloat().getWidth();
+
+    // Axis caption in the bottom-left corner -- below the left margin, in
+    // the ruler row -- which is otherwise always blank (neither the
+    // waveform loop above nor BreakpointEditor's identical margin math ever
+    // draws there), so this can't collide with or shift anything else's
+    // alignment. Deliberately "Read Span," not "Buffer Length" -- the axis
+    // spans readSpan = readScatter * bufferLenMs, NOT the full buffer
+    // length (e.g. at the 0.9 default scatter, a 4000ms buffer's rightmost
+    // tick reads 3.6s, not 4.0s) -- "Buffer Length" overclaimed what's
+    // actually shown here.
+    g.setColour (juce::Colours::grey);
+    g.setFont (10.0f);
+    g.drawText ("Read Span",
+                juce::Rectangle<float> (0.0f, (float) rulerArea.getY(), (float) kVisualizerLeftMargin, (float) rulerArea.getHeight()),
+                juce::Justification::centred);
+
     constexpr int numTicks = 5;
-    g.setFont (13.0f);
     for (int i = 0; i < numTicks; ++i)
     {
         const double frac = (double) i / (double) (numTicks - 1);
-        const float x = waveformArea.getX() + (float) frac * waveformArea.getWidth();
+        const float x = rulerWaveformX + (float) frac * rulerWaveformWidth;
 
         g.setColour (juce::Colours::grey.withAlpha (0.15f));
-        g.drawVerticalLine ((int) x, waveformArea.getY(), waveformArea.getBottom());
+        g.drawVerticalLine ((int) x, (float) kVisualizerTopMargin, (float) rulerArea.getY());
 
         g.setColour (juce::Colours::grey);
         constexpr float labelW = 60.0f;
