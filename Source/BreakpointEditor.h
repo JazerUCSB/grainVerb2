@@ -2,6 +2,7 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PluginProcessor.h"
+#include "GrainVoiceEngine.h"
 #include "VisualizerLayout.h"
 
 // Which curve is currently active/editable. Declared at namespace scope
@@ -41,7 +42,15 @@ enum class CurveKind { Cutoff, Q, Tail };
 class BreakpointEditor : public juce::Component
 {
 public:
-    explicit BreakpointEditor (GrainReverb2AudioProcessor& processorToUse);
+    // processorForSampleRate is only used for getSampleRate() (shared by
+    // every engine in the plugin); engineToShow/stateToEdit point at
+    // whichever specific engine/curve-set this instance edits -- late or
+    // early reflections both use this same class, just constructed with
+    // different references. stateToEdit is non-const (points/mouse edits
+    // mutate its curves directly and call rebake()).
+    BreakpointEditor (GrainReverb2AudioProcessor& processorForSampleRate,
+                       const GrainVoiceEngine& engineToShow,
+                       GrainReverbSharedState& stateToEdit);
 
     void setActiveCurve (CurveKind kind) { activeCurve = kind; repaint(); }
     CurveKind getActiveCurve() const { return activeCurve; }
@@ -83,6 +92,8 @@ private:
     size_t segmentIndexAt (const BreakpointCurve& curve, double dn) const;
 
     GrainReverb2AudioProcessor& processor;
+    const GrainVoiceEngine& engine;
+    GrainReverbSharedState& sharedState;
 
     CurveKind activeCurve = CurveKind::Cutoff;
     int draggedPointIndex = -1;

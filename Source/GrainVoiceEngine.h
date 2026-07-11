@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <vector>
 #include <juce_core/juce_core.h>
 #include "GrainReverbSharedState.h"
@@ -61,11 +60,15 @@ struct DcBlocker
 };
 
 // The ONE granular reverb engine (no longer one instance per channel). Owns
-// genuinely stereo del1/del2 buffers and one shared pool of 100 grains per
-// bank; stereo width comes entirely from each grain's independent
-// readChannel/writeChannel choices, not from routing separate mono engines.
-// Voices are doubled to 200/bank (kNumVoices1/2) so total grain density
-// matches the old two-engine design's 100-per-channel x 2 = 200 total.
+// genuinely stereo del1/del2 buffers and one shared pool of grains per bank;
+// stereo width comes entirely from each grain's independent readChannel/
+// writeChannel choices, not from routing separate mono engines.
+//
+// Voice counts and buffer capacities are configurable (via prepare()'s
+// extra parameters, defaulted to the original late-reflections values) so
+// the SAME class can be reused for a second, smaller early-reflections
+// engine (much shorter buffers, far fewer voices) without duplicating any
+// of this logic -- see PluginProcessor's lateEngine/earlyEngine.
 class GrainVoiceEngine
 {
 public:
@@ -73,7 +76,19 @@ public:
 
     // Allocates del1L/R + del2L/R + grain arrays and seeds them from
     // shared's current tables. Must be called after shared.prepare().
-    void prepare (double newSampleRate, const GrainReverbSharedState& shared);
+    // numVoices1/2 and del1/2MaxSeconds default to the original
+    // late-reflections sizing; pass smaller values to configure a
+    // different-scaled engine (e.g. early reflections).
+    //
+    // numVoices1/2 are the MAXIMUM voices allocated per bank, not
+    // necessarily how many contribute to the output on a given sample --
+    // shared.params.numGrainVoices (live-adjustable, no reallocation) picks
+    // a smaller ACTIVE subset each sample, the same "allocate max, scale
+    // the active portion live" pattern del1Len already uses relative to
+    // del1L's fixed 6-second capacity.
+    void prepare (double newSampleRate, const GrainReverbSharedState& shared,
+                  int numVoices1 = 200, int numVoices2 = 200,
+                  double del1MaxSeconds = 6.0, double del2MaxSeconds = 1.0);
 
     // Runs one sample of the full gen~ signal chain, now stereo in/out.
     void processSample (double inputL, double inputR, const GrainReverbSharedState& shared,
@@ -89,6 +104,13 @@ public:
     const std::vector<double>& getDelayBuffer2 (int channel) const { return channel == 0 ? del2L : del2R; }
     double getWriteHead1() const { return count1; }
     double getWriteHead2() const { return count2; }
+
+    // This engine's configured del1 capacity in seconds (6.0 for the
+    // original late-reflections sizing, smaller for e.g. early reflections)
+    // -- visualizer/curve-editor components need this to convert del1Len
+    // (bufferLenMs as a fraction of THIS engine's own capacity) correctly,
+    // since it's no longer a hardcoded 6 seconds.
+    double getDel1MaxSeconds() const { return del1MaxSeconds; }
 
 private:
     void seedGrains (const GrainReverbSharedState& shared);
@@ -135,16 +157,24 @@ private:
     // in prepare() (depends only on sampleRate), not per sample.
     double hpCoeffG = 0.0;
 
+    // Configured by prepare()'s del1MaxSeconds param -- del1Len (the
+    // *active* wrap boundary within del1's fixed storage) is bufferLenMs
+    // as a fraction of THIS, not a hardcoded 6 seconds. del2 has no
+    // equivalent scaling: del2Len is always del2L.size() outright (del2's
+    // "bufferLenMs" is effectively fixed at del2MaxSeconds*1000).
+    double del1MaxSeconds = 6.0;
+
     // Genuinely stereo now: 2 channels each, allocated at full capacity
-    // (6s / 1s) in prepare() and never resized again. bufferLenMs only
-    // ever changes del1Len, the *active* wrap boundary within that fixed
-    // storage.
+    // (del1MaxSeconds / del2MaxSeconds seconds) in prepare() and never
+    // resized again. bufferLenMs only ever changes del1Len, the *active*
+    // wrap boundary within that fixed storage.
     std::vector<double> del1L, del1R, del2L, del2R;
 
-    static constexpr int kNumVoices1 = 200; // was 100/engine x 2 engines
-    static constexpr int kNumVoices2 = 200; // -- doubled here to match total density
-    std::array<Grain, kNumVoices1> grains1;
-    std::array<Grain, kNumVoices2> grains2;
+    // Sized once in prepare() (from numVoices1/2), never resized again --
+    // a std::vector here is exactly as real-time-safe as the std::array it
+    // replaces, since nothing ever pushes/pops/reallocates it after that.
+    std::vector<Grain> grains1;
+    std::vector<Grain> grains2;
 
     double count1 = 0.0, count2 = 0.0; // write heads (History in gen~), shared by both channels
 

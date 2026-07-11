@@ -109,30 +109,44 @@ namespace
 }
 
 GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2AudioProcessor& p)
-    : AudioProcessorEditor (&p), processorRef (p), bufferVisualizer (p), breakpointEditor (p), dialsPanel (p)
+    : AudioProcessorEditor (&p), processorRef (p),
+      earlyBufferVisualizer (p, p.getEarlyEngine(), p.getEarlySharedState()),
+      earlyBreakpointEditor (p, p.getEarlyEngine(), p.getEarlySharedState()),
+      lateBufferVisualizer (p, p.getLateEngine(), p.getLateSharedState()),
+      lateBreakpointEditor (p, p.getLateEngine(), p.getLateSharedState()),
+      dialsPanel (p)
 {
-    constexpr int radioGroupId = 2001;
-    auto setup = [this] (juce::TextButton& b, CurveKind kind, bool initiallyOn)
+    // Separate radio groups per side -- early's curve-select buttons must
+    // not deselect late's, and vice versa.
+    constexpr int earlyRadioGroupId = 2001;
+    constexpr int lateRadioGroupId  = 2002;
+    auto setup = [] (juce::TextButton& b, BreakpointEditor& editor, int groupId, CurveKind kind, bool initiallyOn)
     {
-        addAndMakeVisible (b);
         b.setClickingTogglesState (true);
-        b.setRadioGroupId (radioGroupId);
+        b.setRadioGroupId (groupId);
         b.setToggleState (initiallyOn, juce::dontSendNotification);
-        b.onClick = [this, kind] { breakpointEditor.setActiveCurve (kind); };
+        b.onClick = [&editor, kind] { editor.setActiveCurve (kind); };
     };
-    setup (cutoffButton, CurveKind::Cutoff, true);
-    setup (qButton, CurveKind::Q, false);
-    setup (tailButton, CurveKind::Tail, false);
+    for (auto* b : { &earlyCutoffButton, &earlyQButton, &earlyTailButton,
+                     &lateCutoffButton, &lateQButton, &lateTailButton })
+        addAndMakeVisible (b);
+    setup (earlyCutoffButton, earlyBreakpointEditor, earlyRadioGroupId, CurveKind::Cutoff, true);
+    setup (earlyQButton,      earlyBreakpointEditor, earlyRadioGroupId, CurveKind::Q,      false);
+    setup (earlyTailButton,   earlyBreakpointEditor, earlyRadioGroupId, CurveKind::Tail,   false);
+    setup (lateCutoffButton,  lateBreakpointEditor,  lateRadioGroupId,  CurveKind::Cutoff, true);
+    setup (lateQButton,       lateBreakpointEditor,  lateRadioGroupId,  CurveKind::Q,      false);
+    setup (lateTailButton,    lateBreakpointEditor,  lateRadioGroupId,  CurveKind::Tail,   false);
 
+    // Tied to LATE reflections only -- see the header comment.
     addAndMakeVisible (measureRt60Button);
     measureRt60Button.onClick = [this]
     {
         if (rt60MeasureThread != nullptr && rt60MeasureThread->isThreadRunning())
             return; // measurement already in progress -- ignore repeat clicks
 
-        auto& shared = processorRef.getSharedState();
+        auto& lateShared = processorRef.getLateSharedState();
         rt60MeasureThread = std::make_unique<RT60MeasureThread> (
-            shared.params, shared.cutoffCurve, shared.qCurve, shared.tailCurve,
+            lateShared.params, lateShared.cutoffCurve, lateShared.qCurve, lateShared.tailCurve,
             processorRef.getSampleRate(),
             [this] (double measured)
             {
@@ -145,14 +159,27 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
 
     addAndMakeVisible (rt60Readout);
     rt60Readout.setJustificationType (juce::Justification::centred);
-    rt60Readout.setFont (juce::FontOptions (13.0f));
+    rt60Readout.setFont (juce::FontOptions (12.0f));
     rt60Readout.setText ("RT60: --", juce::dontSendNotification);
 
-    addAndMakeVisible (bufferVisualizer);
-    addAndMakeVisible (breakpointEditor); // added after -- frontmost for paint + mouse
+    addAndMakeVisible (earlyBufferVisualizer);
+    addAndMakeVisible (earlyBreakpointEditor); // added after -- frontmost for paint + mouse
+    addAndMakeVisible (lateBufferVisualizer);
+    addAndMakeVisible (lateBreakpointEditor);
+
+    addAndMakeVisible (balanceSlider);
+    balanceSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 56, 16);
+    balanceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+        processorRef.apvts, ParamID::balance, balanceSlider);
+
+    addAndMakeVisible (balanceLabel);
+    balanceLabel.setText ("Early <-> Late", juce::dontSendNotification);
+    balanceLabel.setJustificationType (juce::Justification::centred);
+    balanceLabel.setFont (juce::FontOptions (11.0f));
+
     addAndMakeVisible (dialsPanel);
 
-    setSize (700, 702); // +22 for the RT60 readout's own row
+    setSize (1120, 760); // wide enough for two full visualizer panes side by side
 }
 
 GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor()
@@ -168,38 +195,61 @@ GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor()
 void GrainReverb2AudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colours::black);
+
+    // The "little border between the two" -- a thin vertical line down the
+    // middle of the divider strip. dividerLineBounds is set in resized(),
+    // so this can't drift out of sync with the actual layout.
+    g.setColour (juce::Colours::grey.withAlpha (0.4f));
+    g.drawVerticalLine (dividerLineBounds.getCentreX(),
+                         (float) dividerLineBounds.getY(), (float) dividerLineBounds.getBottom());
 }
 
 void GrainReverb2AudioProcessorEditor::resized()
 {
     auto bounds = getLocalBounds().reduced (10);
 
-    auto buttonRow = bounds.removeFromTop (28);
-    measureRt60Button.setBounds (buttonRow.removeFromRight (100).reduced (4, 2));
-    const int w = buttonRow.getWidth() / 3;
-    cutoffButton.setBounds (buttonRow.removeFromLeft (w).reduced (4, 2));
-    qButton.setBounds (buttonRow.removeFromLeft (w).reduced (4, 2));
-    tailButton.setBounds (buttonRow.reduced (4, 2));
+    auto dialsArea = bounds.removeFromBottom (280); // taller grid now (more dials -- early's 6 + late's 9)
+    bounds.removeFromBottom (10); // gap
+    dialsPanel.setBounds (dialsArea);
 
-    // Own row, full width -- the diagnostic "(buf Xms, scat Y)" suffix
-    // added to this readout doesn't fit alongside the buttons above.
-    bounds.removeFromTop (4); // gap
-    rt60Readout.setBounds (bounds.removeFromTop (18));
+    // Divider (balance fader) width reserved from the CENTRE, splitting
+    // what's left evenly between the early (left) and late (right) panes.
+    constexpr int kDividerWidth = 70;
+    const int paneWidth = (bounds.getWidth() - kDividerWidth) / 2;
+    auto earlyPane = bounds.removeFromLeft (paneWidth);
+    auto dividerArea = bounds.removeFromLeft (kDividerWidth);
+    auto latePane = bounds; // remainder
 
+    // ---- Early pane (left) ----
+    auto earlyButtonRow = earlyPane.removeFromTop (28);
+    const int earlyW = earlyButtonRow.getWidth() / 3;
+    earlyCutoffButton.setBounds (earlyButtonRow.removeFromLeft (earlyW).reduced (4, 2));
+    earlyQButton.setBounds (earlyButtonRow.removeFromLeft (earlyW).reduced (4, 2));
+    earlyTailButton.setBounds (earlyButtonRow.reduced (4, 2));
+    earlyPane.removeFromTop (10); // breathing room -- see the late pane's identical comment below
+    earlyBufferVisualizer.setBounds (earlyPane);
+    earlyBreakpointEditor.setBounds (earlyPane); // identical bounds -- lines the overlay up with the waveform
+
+    // ---- Late pane (right) ----
+    auto lateButtonRow = latePane.removeFromTop (28);
+    rt60Readout.setBounds (lateButtonRow.removeFromRight (110).reduced (4, 2));
+    measureRt60Button.setBounds (lateButtonRow.removeFromRight (90).reduced (4, 2));
+    const int lateW = lateButtonRow.getWidth() / 3;
+    lateCutoffButton.setBounds (lateButtonRow.removeFromLeft (lateW).reduced (4, 2));
+    lateQButton.setBounds (lateButtonRow.removeFromLeft (lateW).reduced (4, 2));
+    lateTailButton.setBounds (lateButtonRow.reduced (4, 2));
     // Just visual breathing room below the button row -- the ACTUAL fix for
     // max-value points getting clipped is kVisualizerTopMargin, applied
     // inside both CircularBufferVisualizer's and BreakpointEditor's own
     // plot-area math (clipping happens at a component's own bounds, not
     // here, so this gap alone wouldn't have fixed it).
-    bounds.removeFromTop (10);
+    latePane.removeFromTop (10);
+    lateBufferVisualizer.setBounds (latePane);
+    lateBreakpointEditor.setBounds (latePane);
 
-    auto dialsArea = bounds.removeFromBottom (260); // taller now the dials themselves are bigger
-    bounds.removeFromBottom (10); // gap
-
-    // Identical bounds for both components -- this is what makes the
-    // breakpoint overlay line up with the waveform underneath it.
-    bufferVisualizer.setBounds (bounds);
-    breakpointEditor.setBounds (bounds);
-
-    dialsPanel.setBounds (dialsArea);
+    // ---- Divider (balance fader), vertically centred in its strip ----
+    dividerArea.removeFromTop (28); // align with the button rows on both sides
+    dividerArea.removeFromTop (10);
+    balanceLabel.setBounds (dividerArea.removeFromTop (16));
+    balanceSlider.setBounds (dividerArea.reduced (14, 4));
 }

@@ -3,10 +3,10 @@
 ParamDialsPanel::ParamDialsPanel (GrainReverb2AudioProcessor& processorToUse)
     : processor (processorToUse)
 {
-    // Row 1: Buffer Length, Feedback, Scatter. Row 2: Grain Size, Grain
-    // Variance, Grain Fade. Row 3: Jitter, Dispersion, Mix. Value-readout
-    // formatting (units, decimal places) lives on the parameter itself now
-    // (see PluginProcessor.cpp's createParameterLayout()) -- not here.
+    // Late reflections (10 dials), then early reflections (7 dials) --
+    // value-readout formatting (units, decimal places) lives on the
+    // parameter itself now (see PluginProcessor.cpp's
+    // createParameterLayout()) -- not here.
     addDial (ParamID::bufferLenMs, "Buffer Length");
     addDial (ParamID::feedback, "Feedback");
     addDial (ParamID::readScatter, "Scatter");
@@ -16,6 +16,15 @@ ParamDialsPanel::ParamDialsPanel (GrainReverb2AudioProcessor& processorToUse)
     addDial (ParamID::jitter, "Jitter");
     addDial (ParamID::dispersion, "Dispersion");
     addDial (ParamID::mix, "Mix");
+    addDial (ParamID::numGrainVoices, "Num Grains");
+
+    addDial (ParamID::earlyFeedback, "Early Feedback");
+    addDial (ParamID::earlyMeanWindowMs, "Early Grain Size");
+    addDial (ParamID::earlyWindowRangeMs, "Early Grain Var");
+    addDial (ParamID::earlyFadeSamps, "Early Grain Fade");
+    addDial (ParamID::earlyJitter, "Early Jitter");
+    addDial (ParamID::earlyDispersion, "Early Dispersion");
+    addDial (ParamID::earlyNumGrainVoices, "Early Num Grains");
 }
 
 ParamDialsPanel::Dial& ParamDialsPanel::addDial (const juce::String& paramID, const juce::String& labelText)

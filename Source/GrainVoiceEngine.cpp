@@ -70,18 +70,21 @@ double GrainVoiceEngine::clampReadAgainstWriteHead (double rawRead, double dur, 
     return juce::jlimit (margin, juce::jmax (margin, spanLen - margin), rawRead);
 }
 
-void GrainVoiceEngine::prepare (double newSampleRate, const GrainReverbSharedState& shared)
+void GrainVoiceEngine::prepare (double newSampleRate, const GrainReverbSharedState& shared,
+                                 int numVoices1, int numVoices2,
+                                 double del1MaxSecondsToUse, double del2MaxSecondsToUse)
 {
     sampleRate = newSampleRate;
+    del1MaxSeconds = del1MaxSecondsToUse;
     hpCoeffG = std::exp (-2.0 * juce::MathConstants<double>::pi * 300.0 / sampleRate);
 
-    del1L.assign ((size_t) (6.0 * sampleRate), 0.0);
-    del1R.assign ((size_t) (6.0 * sampleRate), 0.0);
-    del2L.assign ((size_t) (1.0 * sampleRate), 0.0);
-    del2R.assign ((size_t) (1.0 * sampleRate), 0.0);
+    del1L.assign ((size_t) (del1MaxSeconds * sampleRate), 0.0);
+    del1R.assign ((size_t) (del1MaxSeconds * sampleRate), 0.0);
+    del2L.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
+    del2R.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
 
-    grains1.fill (Grain {});
-    grains2.fill (Grain {});
+    grains1.assign ((size_t) numVoices1, Grain {});
+    grains2.assign ((size_t) numVoices2, Grain {});
 
     count1 = count2 = 0.0;
     hpXL = hpYL = hpXR = hpYR = 0.0;
@@ -99,7 +102,7 @@ void GrainVoiceEngine::seedGrains (const GrainReverbSharedState& shared)
     const auto& p = shared.params;
     const auto* coeffs = shared.getLiveCoeffs();
 
-    const double del1Len = std::floor ((p.bufferLenMs / 6000.0) * (double) del1L.size());
+    const double del1Len = std::floor ((p.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
     const double del2Len = (double) del2L.size();
     const double readSpan = p.readScatter * del1Len;
 
@@ -157,7 +160,7 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
     double cnt1 = count1;
     double cnt2 = count2;
 
-    const double del1Len = std::floor ((p.bufferLenMs / 6000.0) * (double) del1L.size());
+    const double del1Len = std::floor ((p.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
     const double del2Len = (double) del2L.size();
     cnt1 = wrapValue (cnt1, 0.0, del1Len);
 
@@ -186,58 +189,79 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
     // (which was the bug: a single shared gain1 double-counted grains that
     // never fed a given channel, under-normalizing both channels).
     double aud1L = 0.0, aud1R = 0.0, gain1L = 0.0, gain1R = 0.0;
-    for (auto& g : grains1)
+    // Live-adjustable "how many of the allocated grains1 voices actually
+    // contribute" -- see GrainReverbParams::numGrainVoices. Only the output
+    // CONTRIBUTION is gated below; every allocated grain's age/read/respawn
+    // bookkeeping still runs unconditionally every sample regardless of
+    // this count (see the comment further down for why).
+    const int activeVoices1 = juce::jlimit (1, (int) grains1.size(), (int) std::round (p.numGrainVoices));
+    for (size_t gi = 0; gi < grains1.size(); ++gi)
     {
-        const auto& srcBuf = (g.readChannel == 0) ? del1L : del1R;
-        const double pos = wrapValue (cnt1 - g.read, 0.0, del1Len);
-        const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del1Len);
-        double au = peekLinear (srcBuf, readPos);
+        auto& g = grains1[gi];
 
-        // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
-        const double yf = g.b0 * au + g.z1;
-        g.z1 = g.b1 * au - g.a1 * yf + g.z2;
-        g.z2 = g.b2 * au - g.a2 * yf;
-        au = yf;
-        // -----------------------------------------------------------
-
-        const double rampUp = juce::jmin (1.0, g.age / p.fadeSamps);
-        const double rampDwn = juce::jmin (1.0, (g.dur - g.age) / p.fadeSamps);
-        const double trap = juce::jmin (rampUp, rampDwn);
-        au *= trap;
-
-        // tail: continuous lookup on the grain's CURRENT distance behind the
-        // write head. Deliberately NOT g.read/readSpan -- g.read increments
-        // by a flat 1.0 every sample (see below) purely as bookkeeping to
-        // keep `pos` fixed; it does NOT track "how far behind the write
-        // head is this grain currently reading," which is cnt1 - readPos
-        // (constant at rate=1, drifting by (1-rate) per sample otherwise).
-        // Using g.read directly here meant that for any grain spawned with
-        // read close to del1Len -- likely exactly as readScatter -> 1, since
-        // readSpan approaches del1Len -- g.read would wrap from ~del1Len
-        // back to ~0 within a handful of samples of spawning, snapping dnT
-        // from ~1.0 (heavily tail-attenuated) to ~0.0 (full volume) in a
-        // single sample: a sudden, loud, still-heavily-lowpassed (frozen
-        // coefficients don't update mid-life) blast of "old" content --
-        // exactly the distorted echo, present at ANY jitter setting since
-        // it's not a rate-drift bug, just worse at high scatter.
-        const double trueGap = wrapValue (cnt1 - readPos, 0.0, del1Len);
-        const double dnT = juce::jlimit (0.0, 1.0, trueGap / readSpan);
-        const int idxT = juce::jlimit (0, kNumTableSlots - 1,
-                                        (int) std::round (dnT * (double) (kNumTableSlots - 1)));
-        au *= curves->tail[(size_t) idxT];
-
-        const double signedAu = au * g.sign;
-        if (g.writeChannel == 0)
+        if ((int) gi < activeVoices1)
         {
-            aud1L += signedAu;
-            gain1L += trap * trap;
-        }
-        else
-        {
-            aud1R += signedAu;
-            gain1R += trap * trap;
+            const auto& srcBuf = (g.readChannel == 0) ? del1L : del1R;
+            const double pos = wrapValue (cnt1 - g.read, 0.0, del1Len);
+            const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del1Len);
+            double au = peekLinear (srcBuf, readPos);
+
+            // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
+            const double yf = g.b0 * au + g.z1;
+            g.z1 = g.b1 * au - g.a1 * yf + g.z2;
+            g.z2 = g.b2 * au - g.a2 * yf;
+            au = yf;
+            // -----------------------------------------------------------
+
+            const double rampUp = juce::jmin (1.0, g.age / p.fadeSamps);
+            const double rampDwn = juce::jmin (1.0, (g.dur - g.age) / p.fadeSamps);
+            const double trap = juce::jmin (rampUp, rampDwn);
+            au *= trap;
+
+            // tail: continuous lookup on the grain's CURRENT distance behind
+            // the write head. Deliberately NOT g.read/readSpan -- g.read
+            // increments by a flat 1.0 every sample (see below) purely as
+            // bookkeeping to keep `pos` fixed; it does NOT track "how far
+            // behind the write head is this grain currently reading," which
+            // is cnt1 - readPos (constant at rate=1, drifting by (1-rate)
+            // per sample otherwise). Using g.read directly here meant that
+            // for any grain spawned with read close to del1Len -- likely
+            // exactly as readScatter -> 1, since readSpan approaches
+            // del1Len -- g.read would wrap from ~del1Len back to ~0 within a
+            // handful of samples of spawning, snapping dnT from ~1.0
+            // (heavily tail-attenuated) to ~0.0 (full volume) in a single
+            // sample: a sudden, loud, still-heavily-lowpassed (frozen
+            // coefficients don't update mid-life) blast of "old" content --
+            // exactly the distorted echo, present at ANY jitter setting
+            // since it's not a rate-drift bug, just worse at high scatter.
+            const double trueGap = wrapValue (cnt1 - readPos, 0.0, del1Len);
+            const double dnT = juce::jlimit (0.0, 1.0, trueGap / readSpan);
+            const int idxT = juce::jlimit (0, kNumTableSlots - 1,
+                                            (int) std::round (dnT * (double) (kNumTableSlots - 1)));
+            au *= curves->tail[(size_t) idxT];
+
+            const double signedAu = au * g.sign;
+            if (g.writeChannel == 0)
+            {
+                aud1L += signedAu;
+                gain1L += trap * trap;
+            }
+            else
+            {
+                aud1R += signedAu;
+                gain1R += trap * trap;
+            }
         }
 
+        // Runs for EVERY allocated grain, active or not -- an inactive
+        // grain's read anchor (pos = writeHead - read) only stays correctly
+        // fixed if `read` keeps incrementing in lockstep with the write
+        // head every single sample (see the clampReadAgainstWriteHead
+        // comment). Skipping this while inactive would let a grain's anchor
+        // silently drift out of sync, so when it's reactivated later
+        // (raising the voice-count dial back up) it could read a sudden,
+        // wrong jump in content -- reintroducing a variant of the exact
+        // collision/glitch class already fixed once for this engine.
         g.age += 1.0;
         g.read += 1.0;
         g.read = wrapValue (g.read, 0.0, del1Len);
@@ -268,37 +292,44 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
     //  del2Len), still WITHOUT the tail decay curve, which stays Bank-1-only.
     // =====================================================================
     double aud2L = 0.0, aud2R = 0.0, gain2L = 0.0, gain2R = 0.0;
-    for (auto& g : grains2)
+    const int activeVoices2 = juce::jlimit (1, (int) grains2.size(), (int) std::round (p.numGrainVoices));
+    for (size_t gi = 0; gi < grains2.size(); ++gi)
     {
-        const auto& srcBuf = (g.readChannel == 0) ? del2L : del2R;
-        const double pos = wrapValue (cnt2 - g.read, 0.0, del2Len);
-        const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del2Len);
-        double au = peekLinear (srcBuf, readPos);
+        auto& g = grains2[gi];
 
-        // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
-        const double yf2 = g.b0 * au + g.z1;
-        g.z1 = g.b1 * au - g.a1 * yf2 + g.z2;
-        g.z2 = g.b2 * au - g.a2 * yf2;
-        au = yf2;
-        // -----------------------------------------------------------
-
-        const double rampUp = juce::jmin (1.0, g.age / p.fadeSamps);
-        const double rampDwn = juce::jmin (1.0, (g.dur - g.age) / p.fadeSamps);
-        const double trap = juce::jmin (rampUp, rampDwn);
-        au *= trap;
-
-        const double signedAu = au * g.sign;
-        if (g.writeChannel == 0)
+        if ((int) gi < activeVoices2)
         {
-            aud2L += signedAu;
-            gain2L += trap * trap;
-        }
-        else
-        {
-            aud2R += signedAu;
-            gain2R += trap * trap;
+            const auto& srcBuf = (g.readChannel == 0) ? del2L : del2R;
+            const double pos = wrapValue (cnt2 - g.read, 0.0, del2Len);
+            const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del2Len);
+            double au = peekLinear (srcBuf, readPos);
+
+            // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
+            const double yf2 = g.b0 * au + g.z1;
+            g.z1 = g.b1 * au - g.a1 * yf2 + g.z2;
+            g.z2 = g.b2 * au - g.a2 * yf2;
+            au = yf2;
+            // -----------------------------------------------------------
+
+            const double rampUp = juce::jmin (1.0, g.age / p.fadeSamps);
+            const double rampDwn = juce::jmin (1.0, (g.dur - g.age) / p.fadeSamps);
+            const double trap = juce::jmin (rampUp, rampDwn);
+            au *= trap;
+
+            const double signedAu = au * g.sign;
+            if (g.writeChannel == 0)
+            {
+                aud2L += signedAu;
+                gain2L += trap * trap;
+            }
+            else
+            {
+                aud2R += signedAu;
+                gain2R += trap * trap;
+            }
         }
 
+        // See Bank 1's identical comment above -- must run unconditionally.
         g.age += 1.0;
         g.read += 1.0;
         g.read = wrapValue (g.read, 0.0, del2Len);

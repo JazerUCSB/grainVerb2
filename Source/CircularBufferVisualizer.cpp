@@ -18,8 +18,10 @@ namespace
     }
 }
 
-CircularBufferVisualizer::CircularBufferVisualizer (GrainReverb2AudioProcessor& processorToUse)
-    : processor (processorToUse)
+CircularBufferVisualizer::CircularBufferVisualizer (GrainReverb2AudioProcessor& processorForSampleRate,
+                                                      const GrainVoiceEngine& engineToShow,
+                                                      const GrainReverbSharedState& stateToShow)
+    : processor (processorForSampleRate), engine (engineToShow), sharedState (stateToShow)
 {
     // 24fps rather than 30 -- extra headroom now that this repaints both
     // channels' worth of buffer-scan work instead of one.
@@ -40,17 +42,16 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colours::black);
 
-    const auto& engineRef = processor.getEngine();
-    const auto& bufL = engineRef.getDelayBuffer1 (0);
-    const auto& bufR = engineRef.getDelayBuffer1 (1);
-    const double writeHead = engineRef.getWriteHead1();
+    const auto& bufL = engine.getDelayBuffer1 (0);
+    const auto& bufR = engine.getDelayBuffer1 (1);
+    const double writeHead = engine.getWriteHead1();
     const double sampleRate = processor.getSampleRate();
-    const auto& params = processor.getSharedState().params;
+    const auto& params = sharedState.params;
 
     if (bufL.empty() || sampleRate <= 0.0)
         return;
 
-    const double del1Len = std::floor ((params.bufferLenMs / 6000.0) * (double) bufL.size());
+    const double del1Len = std::floor ((params.bufferLenMs / (engine.getDel1MaxSeconds() * 1000.0)) * (double) bufL.size());
     const double readSpan = juce::jmax (1.0, params.readScatter * del1Len);
     const double maxSeconds = readSpan / sampleRate;
 

@@ -30,6 +30,27 @@ namespace
         return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
             [] (float v, int) { return juce::String ((juce::int64) std::round (v)) + " samps"; });
     }
+
+    juce::AudioParameterFloatAttributes grainsUnitAttrs()
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int) { return juce::String ((juce::int64) std::round (v)) + " grains"; });
+    }
+
+    // Early reflections' fixed sizing -- no user-adjustable bufferLenMs/
+    // readScatter (see ParamID::earlyFadeSamps and friends' comment), so
+    // these are the only place these numbers live.
+    constexpr double kEarlyDel1MaxSeconds = 1.0; // 1000ms
+    constexpr double kEarlyDel2MaxSeconds = 0.6; // 600ms
+
+    // MAXIMUM voices allocated per bank -- matches each engine's own
+    // numGrainVoices dial range's upper bound (see createParameterLayout()).
+    // The dial's live value only picks how many of these are ACTIVE each
+    // sample (GrainReverbParams::numGrainVoices); the allocation itself
+    // never changes after prepare(), so moving the dial can't reallocate on
+    // the audio thread.
+    constexpr int kLateMaxVoicesPerBank  = 100;
+    constexpr int kEarlyMaxVoicesPerBank = 30;
 }
 
 GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
@@ -49,6 +70,16 @@ GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
     jitterParam        = apvts.getRawParameterValue (ParamID::jitter);
     dispersionParam    = apvts.getRawParameterValue (ParamID::dispersion);
     mixParam           = apvts.getRawParameterValue (ParamID::mix);
+    numGrainVoicesParam = apvts.getRawParameterValue (ParamID::numGrainVoices);
+
+    earlyFadeSampsParam      = apvts.getRawParameterValue (ParamID::earlyFadeSamps);
+    earlyMeanWindowMsParam   = apvts.getRawParameterValue (ParamID::earlyMeanWindowMs);
+    earlyWindowRangeMsParam  = apvts.getRawParameterValue (ParamID::earlyWindowRangeMs);
+    earlyFeedbackParam       = apvts.getRawParameterValue (ParamID::earlyFeedback);
+    earlyJitterParam         = apvts.getRawParameterValue (ParamID::earlyJitter);
+    earlyDispersionParam     = apvts.getRawParameterValue (ParamID::earlyDispersion);
+    earlyNumGrainVoicesParam = apvts.getRawParameterValue (ParamID::earlyNumGrainVoices);
+    balanceParam             = apvts.getRawParameterValue (ParamID::balance);
 
     // No allocation here otherwise -- sample rate isn't known yet. Real
     // DSP setup happens in prepareToPlay().
@@ -93,13 +124,50 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::mix, 1 }, "Mix",
         Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::numGrainVoices, 1 }, "Number of Grains",
+        Range { 25.0f, 100.0f }, 100.0f, grainsUnitAttrs()));
+
+    // Early reflections -- own fadeSamps/grain size/variance/feedback/
+    // jitter/dispersion, but no bufferLenMs/readScatter: its del1/del2 are
+    // always fully active (fixed 1000ms/600ms, set in prepareToPlay()/
+    // syncParams()), the same way late's OWN del2 has no scatter control.
+    // Defaults for grain size/variance match the 1000ms buffer's spec
+    // (100ms grains, 25ms variance); the 600ms buffer's smaller 50ms/15ms
+    // grains aren't separately controllable -- one shared dial set governs
+    // both of early's banks, exactly like late's meanWindowMs/windowRangeMs
+    // already governs both del1 and del2 today.
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyFadeSamps, 1 }, "Early Fade (samples)",
+        Range { 3.0f, 2000.0f }, 100.0f, sampsUnitAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyMeanWindowMs, 1 }, "Early Grain Size (ms)",
+        Range { 1.0f, 500.0f }, 100.0f, msUnitAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyWindowRangeMs, 1 }, "Early Grain Size Variance (ms)",
+        Range { 1.0f, 200.0f }, 25.0f, msUnitAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyFeedback, 1 }, "Early Feedback",
+        Range { 0.0f, 0.999f }, 0.3f, plain3DecimalAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyJitter, 1 }, "Early Rate Jitter",
+        Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyDispersion, 1 }, "Early Stereo Dispersion",
+        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::earlyNumGrainVoices, 1 }, "Early Number of Grains",
+        Range { 5.0f, 30.0f }, 16.0f, grainsUnitAttrs()));
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::balance, 1 }, "Early/Late Balance",
+        Range { 0.0f, 1.0f }, 0.5f, plain3DecimalAttrs()));
 
     return { params.begin(), params.end() };
 }
 
 void GrainReverb2AudioProcessor::syncParams()
 {
-    auto& p = shared.params;
+    auto& p = lateShared.params;
     p.fadeSamps     = (double) fadeSampsParam->load();
     p.meanWindowMs  = (double) meanWindowMsParam->load();
     p.windowRangeMs = (double) windowRangeMsParam->load();
@@ -108,6 +176,23 @@ void GrainReverb2AudioProcessor::syncParams()
     p.readScatter   = (double) readScatterParam->load();
     p.jitter        = (double) jitterParam->load();
     p.dispersion    = (double) dispersionParam->load();
+    p.numGrainVoices = (double) numGrainVoicesParam->load();
+
+    auto& ep = earlyShared.params;
+    ep.fadeSamps     = (double) earlyFadeSampsParam->load();
+    ep.meanWindowMs  = (double) earlyMeanWindowMsParam->load();
+    ep.windowRangeMs = (double) earlyWindowRangeMsParam->load();
+    ep.fb            = (double) earlyFeedbackParam->load();
+    ep.jitter        = (double) earlyJitterParam->load();
+    ep.dispersion    = (double) earlyDispersionParam->load();
+    ep.numGrainVoices = (double) earlyNumGrainVoicesParam->load();
+    // No dial for these -- early's del1/del2 are always fully active (see
+    // the ParamID::earlyFadeSamps comment), matching how del1Len/readSpan
+    // are computed: bufferLenMs at its own max (del1MaxSeconds*1000) and
+    // readScatter at 1.0 mean del1Len == del1L.size() and readSpan ==
+    // del1Len, i.e. no scatter-limited subset, ever.
+    ep.bufferLenMs   = kEarlyDel1MaxSeconds * 1000.0;
+    ep.readScatter   = 1.0;
 }
 
 GrainReverb2AudioProcessor::~GrainReverb2AudioProcessor() {}
@@ -115,8 +200,13 @@ GrainReverb2AudioProcessor::~GrainReverb2AudioProcessor() {}
 void GrainReverb2AudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
 {
     syncParams(); // pick up current APVTS values (e.g. a loaded preset) before seeding grains
-    shared.prepare (sampleRate);
-    engine.prepare (sampleRate, shared);
+
+    lateShared.prepare (sampleRate);
+    lateEngine.prepare (sampleRate, lateShared, kLateMaxVoicesPerBank, kLateMaxVoicesPerBank); // 6s/1s buffers (defaults)
+
+    earlyShared.prepare (sampleRate);
+    earlyEngine.prepare (sampleRate, earlyShared, kEarlyMaxVoicesPerBank, kEarlyMaxVoicesPerBank,
+                          kEarlyDel1MaxSeconds, kEarlyDel2MaxSeconds);
 }
 
 void GrainReverb2AudioProcessor::releaseResources() {}
@@ -139,14 +229,25 @@ void GrainReverb2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int numSamples = buffer.getNumSamples();
 
     const double mix = (double) mixParam->load();
+    const double balance = (double) balanceParam->load();
 
     for (int i = 0; i < numSamples; ++i)
     {
         const double dryL = (double) left[i];
         const double dryR = (double) right[i];
 
-        double wetL = 0.0, wetR = 0.0;
-        engine.processSample (dryL, dryR, shared, wetL, wetR);
+        // Parallel, not series: both engines process the SAME dry input
+        // independently, each with its own del1/del2 feedback loop -- two
+        // self-contained reverb tanks running side by side, crossfaded by
+        // balance rather than one feeding the other.
+        double lateWetL = 0.0, lateWetR = 0.0;
+        lateEngine.processSample (dryL, dryR, lateShared, lateWetL, lateWetR);
+
+        double earlyWetL = 0.0, earlyWetR = 0.0;
+        earlyEngine.processSample (dryL, dryR, earlyShared, earlyWetL, earlyWetR);
+
+        const double wetL = lateWetL * (1.0 - balance) + earlyWetL * balance;
+        const double wetR = lateWetR * (1.0 - balance) + earlyWetR * balance;
 
         left[i]  = (float) (dryL * (1.0 - mix) + wetL * mix);
         right[i] = (float) (dryR * (1.0 - mix) + wetR * mix);

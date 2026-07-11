@@ -2,22 +2,23 @@
 #include <algorithm>
 #include <cmath>
 
-BreakpointEditor::BreakpointEditor (GrainReverb2AudioProcessor& processorToUse)
-    : processor (processorToUse)
+BreakpointEditor::BreakpointEditor (GrainReverb2AudioProcessor& processorForSampleRate,
+                                     const GrainVoiceEngine& engineToShow,
+                                     GrainReverbSharedState& stateToEdit)
+    : processor (processorForSampleRate), engine (engineToShow), sharedState (stateToEdit)
 {
 }
 
 BreakpointCurve& BreakpointEditor::curveFor (CurveKind kind)
 {
-    auto& shared = processor.getSharedState();
     switch (kind)
     {
-        case CurveKind::Cutoff: return shared.cutoffCurve;
-        case CurveKind::Q:      return shared.qCurve;
-        case CurveKind::Tail:   return shared.tailCurve;
+        case CurveKind::Cutoff: return sharedState.cutoffCurve;
+        case CurveKind::Q:      return sharedState.qCurve;
+        case CurveKind::Tail:   return sharedState.tailCurve;
     }
     jassertfalse;
-    return shared.cutoffCurve;
+    return sharedState.cutoffCurve;
 }
 
 const BreakpointEditor::CurveStyle& BreakpointEditor::styleFor (CurveKind kind) const
@@ -270,10 +271,10 @@ void BreakpointEditor::drawDragValuePopup (juce::Graphics& g)
     const float py = valueToY (pt.y, activeCurve, plot);
 
     // Exact dn -> seconds-since-written conversion, same as the ruler.
-    const auto& params = processor.getSharedState().params;
+    const auto& params = sharedState.params;
     const double sampleRate = processor.getSampleRate();
-    const double capacity = (double) processor.getEngine().getDelayBuffer1 (0).size();
-    const double del1Len = std::floor ((params.bufferLenMs / 6000.0) * capacity);
+    const double capacity = (double) engine.getDelayBuffer1 (0).size();
+    const double del1Len = std::floor ((params.bufferLenMs / (engine.getDel1MaxSeconds() * 1000.0)) * capacity);
     const double readSpan = juce::jmax (1.0, params.readScatter * del1Len);
     const double seconds = sampleRate > 0.0 ? pt.x * readSpan / sampleRate : 0.0;
 
@@ -347,7 +348,7 @@ void BreakpointEditor::mouseDown (const juce::MouseEvent& e)
         if (isInteriorPoint)
         {
             curve.points.erase (curve.points.begin() + idx);
-            processor.getSharedState().rebake();
+            sharedState.rebake();
             repaint();
         }
         return;
@@ -380,7 +381,7 @@ void BreakpointEditor::mouseDown (const juce::MouseEvent& e)
             (curve.points[segIdx].segmentType == CurveInterpolation::Linear)
                 ? CurveInterpolation::Exponential
                 : CurveInterpolation::Linear;
-        processor.getSharedState().rebake();
+        sharedState.rebake();
         repaint();
         return;
     }
@@ -412,7 +413,7 @@ void BreakpointEditor::mouseDrag (const juce::MouseEvent& e)
         const double newCurvature = curvatureDragStartValue + (double) deltaPixels * curvatureSensitivity;
         curve.points[curvatureDragSegment].curvature = juce::jlimit (-maxCurvature, maxCurvature, newCurvature);
 
-        processor.getSharedState().rebake();
+        sharedState.rebake();
         repaint();
         return;
     }
@@ -446,7 +447,7 @@ void BreakpointEditor::mouseDrag (const juce::MouseEvent& e)
 
     pt.y = yToValue (e.position.y, activeCurve, plot);
 
-    processor.getSharedState().rebake();
+    sharedState.rebake();
     repaint();
 }
 
@@ -484,6 +485,6 @@ void BreakpointEditor::mouseDoubleClick (const juce::MouseEvent& e)
                                               [] (const Breakpoint& a, const Breakpoint& b) { return a.x < b.x; });
     curve.points.insert (insertPos, newPoint);
 
-    processor.getSharedState().rebake();
+    sharedState.rebake();
     repaint();
 }

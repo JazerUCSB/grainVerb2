@@ -3,6 +3,7 @@
 #include <vector>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PluginProcessor.h"
+#include "GrainVoiceEngine.h"
 #include "VisualizerLayout.h"
 
 // Raw scrolling view of BOTH channels of the engine's del1 circular buffer,
@@ -31,7 +32,14 @@ class CircularBufferVisualizer : public juce::Component,
                                   private juce::Timer
 {
 public:
-    explicit CircularBufferVisualizer (GrainReverb2AudioProcessor& processorToUse);
+    // processorForSampleRate is only used for getSampleRate() (shared by
+    // every engine in the plugin); engineToShow/stateToShow point at
+    // whichever specific engine/params this instance should visualize --
+    // late or early reflections both use this same class, just constructed
+    // with different references.
+    CircularBufferVisualizer (GrainReverb2AudioProcessor& processorForSampleRate,
+                               const GrainVoiceEngine& engineToShow,
+                               const GrainReverbSharedState& stateToShow);
     ~CircularBufferVisualizer() override;
 
     void paint (juce::Graphics&) override;
@@ -40,6 +48,8 @@ private:
     void timerCallback() override;
 
     GrainReverb2AudioProcessor& processor;
+    const GrainVoiceEngine& engine;
+    const GrainReverbSharedState& sharedState;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CircularBufferVisualizer)
 };

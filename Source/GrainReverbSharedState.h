@@ -42,6 +42,17 @@ struct GrainReverbParams
     // used to be a top-level "swap L/R engines" control; it's now applied
     // per grain inside the single merged engine (see GrainVoiceEngine.h).
     double dispersion    = 1.0;
+
+    // How many of this engine's ALLOCATED grain voices (per bank) actually
+    // contribute to the output right now -- live-adjustable without any
+    // audio-thread reallocation, since GrainVoiceEngine always allocates
+    // grains1/grains2 at their configured MAXIMUM size (see prepare()) and
+    // just gates output contribution by this count. See
+    // GrainVoiceEngine::processSample() for why the age/read/respawn
+    // bookkeeping still runs for every allocated grain regardless of this
+    // value -- skipping it would desync a grain's read anchor from the
+    // write head while inactive.
+    double numGrainVoices = 100.0;
 };
 
 // Shared, control-rate state: the three user-editable breakpoint curves,
