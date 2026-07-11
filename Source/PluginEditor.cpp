@@ -1,76 +1,111 @@
 #include "PluginEditor.h"
-#include <cmath>
 
 namespace
 {
-    // Cheap, closed-form RT60 estimate (PDF Section 2.6) -- NOT a
-    // measurement, just a fast always-available number computed on demand
-    // from the current params when rt60Button is clicked. See the earlier
-    // (reverted) live output-capture visualizer for why this stays a
-    // one-shot snapshot rather than a continuously-updating view: scanning
-    // enough history to redraw a scrolling waveform every frame was heavy
-    // enough to audibly starve the audio thread.
+    // Empirical RT60 measurement -- runs a completely separate, throwaway
+    // GrainVoiceEngine (never the live one, so it can't disturb what's
+    // actually playing) on a background thread, feeds it a single-sample
+    // impulse followed by silence, and captures the output. This can run
+    // MUCH faster than real time: processSample() has no dependency on
+    // actual wall-clock time, only on how many samples have been fed to
+    // it, so a tight loop can push through a 30-second "virtual" decay in
+    // a handful of seconds of real compute rather than needing to wait out
+    // the full 30 seconds.
     //
-    // TWO independent self-feedback loops shape the tail, not one:
-    //   - del1: write = input + fb*aud1 -- decays per readScatter/
-    //     bufferLenMs, average grain delay 0.5*readScatter*bufferLenMs.
-    //     Bank 1 grains ALSO multiply by the live tail curve every pass
-    //     (processSample()'s `au *= curves->tail[idxT]`) -- a real,
-    //     user-controlled extra attenuation completely separate from fb.
-    //     Averaging the live tail table over dn approximates that (grain
-    //     read offsets are uniform over [0, readSpan], so dn is uniform
-    //     over [0,1] -- a flat average is a reasonable stand-in for "the
-    //     typical grain's extra cut this pass"). The default curve alone
-    //     is roughly a 7.5dB-per-pass extra cut that the first version of
-    //     this estimate ignored entirely.
-    //   - del2: write = fb*(aud1+aud2) -- a SEPARATE self-feedback loop,
-    //     no tail curve applied (Bank 2 skips it by design). The actual
-    //     audible output is aud2 (see processSample()'s
-    //     outputL = aud2L * 2.0), not aud1. del2 is a fixed 1-second
-    //     buffer (GrainVoiceEngine::prepare()'s del2L/R.assign) with no
-    //     scatter param -- its own average grain delay is always 0.5s,
-    //     independent of readScatter/bufferLenMs entirely.
-    // In a pair of coupled decaying feedback loops, the faster one
-    // generally dominates what's perceptible (the slower one's tail keeps
-    // going, but far too quietly to matter once the faster one has died
-    // out) -- taking the smaller of the two estimates tracks that.
+    // Measures via Schroeder backward integration (the standard acoustic
+    // RT60 method): reverse-cumulative energy E(t) = sum of e(s) for s>=t
+    // is guaranteed monotonically non-increasing, so unlike a raw envelope
+    // (which oscillates through zero) there's exactly one crossing point
+    // to find, no smoothing/windowing needed. E(0) is the reference (0dB);
+    // RT60 is the first t where E(t) has dropped 60dB (energy ratio 1e-6,
+    // since dB-for-energy uses 10*log10 not 20*log10) below that.
     //
-    // Past this, the model is still a simplification: it treats each pass
-    // as ONE coherent signal multiplied by a scalar, but the real signal
-    // is ~200 overlapping grains -- half with flipped polarity
-    // (Grain::sign) -- reading from different points in the decay history
-    // and summing INCOHERENTLY (which is exactly why the engine
-    // RMS-normalizes by sqrt(gain1L) rather than dividing by grain count).
-    // Per-grain lowpass filtering removes further energy per pass too.
-    // Neither is folded in here -- a closed-form comb-filter formula
-    // structurally can't capture ensemble decorrelation or filter energy
-    // loss, so this stays a rough ballpark, not a precise number.
-    constexpr double kDel2Seconds = 1.0; // must match GrainVoiceEngine's del2 allocation
-
-    double estimateRT60Seconds (const GrainReverbSharedState& shared)
+    // ALWAYS captures the full 30s window before analyzing, deliberately --
+    // an earlier version tried to save time with growing blocks (analyze
+    // after 5s, then 10s, etc., stopping at the first crossing found) and
+    // treated whatever had been captured SO FAR as if it were the complete
+    // signal. That silently under-measured whenever a slower contribution
+    // (e.g. del1's own loop, which gets slower as bufferLenMs grows) was
+    // still feeding real energy in past the current block boundary: the
+    // truncated E(0) reference missed that later energy, so the -60dB
+    // target was reached (and reported) too early, before the full decay
+    // had actually happened. Analyzing once over the complete capture is
+    // the only way to guarantee E(0) reflects the true total energy.
+    class RT60MeasureThread : public juce::Thread
     {
-        const auto& p = shared.params;
-        const auto* curves = shared.getLiveCurves();
+    public:
+        RT60MeasureThread (GrainReverbParams paramsSnapshot, BreakpointCurve cutoff,
+                            BreakpointCurve q, BreakpointCurve tail, double sampleRateToUse,
+                            std::function<void (double)> onMeasured)
+            : juce::Thread ("RT60 Measure"),
+              params (std::move (paramsSnapshot)),
+              cutoffCurve (std::move (cutoff)), qCurve (std::move (q)), tailCurve (std::move (tail)),
+              sampleRate (sampleRateToUse), callback (std::move (onMeasured))
+        {
+        }
 
-        const double fb = juce::jlimit (1.0e-6, 0.999999, p.fb);
+        void run() override
+        {
+            // A fresh shared state + engine, entirely separate from the
+            // live one the processor owns -- this measurement can't affect
+            // (or be affected by) whatever's actually being played.
+            GrainReverbSharedState localShared;
+            localShared.params = params;
+            localShared.cutoffCurve = cutoffCurve;
+            localShared.qCurve = qCurve;
+            localShared.tailCurve = tailCurve;
+            localShared.prepare (sampleRate);
 
-        double tailSum = 0.0;
-        for (double v : curves->tail)
-            tailSum += v;
-        const double avgTailGain = juce::jlimit (1.0e-6, 1.0, tailSum / (double) kNumTableSlots);
+            GrainVoiceEngine engine;
+            engine.prepare (sampleRate, localShared);
 
-        const double effectiveGainDel1 = juce::jlimit (1.0e-6, 0.999999, fb * avgTailGain);
-        const double logInvFbDel1 = std::log10 (1.0 / effectiveGainDel1);
-        const double t1Del1 = 0.5 * p.readScatter * (p.bufferLenMs / 1000.0);
-        const double rt60Del1 = 3.0 * t1Del1 / logInvFbDel1;
+            constexpr double maxSeconds = 30.0;
+            const int totalSamples = (int) (maxSeconds * sampleRate);
+            std::vector<double> energy ((size_t) totalSamples, 0.0);
 
-        const double logInvFb = std::log10 (1.0 / fb);
-        const double t1Del2 = 0.5 * kDel2Seconds;
-        const double rt60Del2 = 3.0 * t1Del2 / logInvFb;
+            for (int i = 0; i < totalSamples; ++i)
+            {
+                if ((i & 0xfff) == 0 && threadShouldExit())
+                    return;
 
-        const double rt60 = juce::jmin (rt60Del1, rt60Del2);
-        return juce::jlimit (0.05, 30.0, rt60);
-    }
+                double inL = 0.0, inR = 0.0;
+                if (i == 0) { inL = inR = 1.0; } // single-sample impulse, then silence
+
+                double outL = 0.0, outR = 0.0;
+                engine.processSample (inL, inR, localShared, outL, outR);
+                energy[(size_t) i] = 0.5 * (outL * outL + outR * outR);
+            }
+
+            std::vector<double> reverseEnergy (energy.size());
+            double acc = 0.0;
+            for (int i = (int) energy.size() - 1; i >= 0; --i)
+            {
+                acc += energy[(size_t) i];
+                reverseEnergy[(size_t) i] = acc;
+            }
+
+            double measured = maxSeconds; // never crossed -60dB within the cap
+            const double target = reverseEnergy[0] * 1.0e-6; // -60dB in energy terms
+            for (size_t i = 0; i < reverseEnergy.size(); ++i)
+            {
+                if (reverseEnergy[i] <= target)
+                {
+                    measured = (double) i / sampleRate;
+                    break;
+                }
+            }
+
+            const auto result = measured;
+            const auto cb = callback;
+            juce::MessageManager::callAsync ([cb, result] { cb (result); });
+        }
+
+    private:
+        GrainReverbParams params;
+        BreakpointCurve cutoffCurve, qCurve, tailCurve;
+        double sampleRate;
+        std::function<void (double)> callback;
+    };
 }
 
 GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2AudioProcessor& p)
@@ -89,15 +124,27 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
     setup (qButton, CurveKind::Q, false);
     setup (tailButton, CurveKind::Tail, false);
 
-    addAndMakeVisible (rt60Button);
-    rt60Button.onClick = [this]
+    addAndMakeVisible (measureRt60Button);
+    measureRt60Button.onClick = [this]
     {
-        const auto rt60 = estimateRT60Seconds (processorRef.getSharedState());
-        rt60Readout.setText ("RT60 ~ " + juce::String (rt60, 2) + "s", juce::dontSendNotification);
+        if (rt60MeasureThread != nullptr && rt60MeasureThread->isThreadRunning())
+            return; // measurement already in progress -- ignore repeat clicks
+
+        auto& shared = processorRef.getSharedState();
+        rt60MeasureThread = std::make_unique<RT60MeasureThread> (
+            shared.params, shared.cutoffCurve, shared.qCurve, shared.tailCurve,
+            processorRef.getSampleRate(),
+            [this] (double measured)
+            {
+                rt60Readout.setText ("RT60 meas ~ " + juce::String (measured, 2) + "s", juce::dontSendNotification);
+            });
+
+        rt60Readout.setText ("Measuring...", juce::dontSendNotification);
+        rt60MeasureThread->startThread();
     };
 
     addAndMakeVisible (rt60Readout);
-    rt60Readout.setJustificationType (juce::Justification::centredLeft);
+    rt60Readout.setJustificationType (juce::Justification::centred);
     rt60Readout.setFont (juce::FontOptions (13.0f));
     rt60Readout.setText ("RT60: --", juce::dontSendNotification);
 
@@ -105,10 +152,18 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
     addAndMakeVisible (breakpointEditor); // added after -- frontmost for paint + mouse
     addAndMakeVisible (dialsPanel);
 
-    setSize (700, 680); // 3x3 dial grid is taller now the dials themselves are bigger
+    setSize (700, 702); // +22 for the RT60 readout's own row
 }
 
-GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor() {}
+GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor()
+{
+    // Give the measurement thread a chance to notice threadShouldExit() at
+    // its next check (at most every 4096 samples -- see RT60MeasureThread::
+    // run()) and unwind cleanly before this editor (and the callback that
+    // captures `this`) goes away.
+    if (rt60MeasureThread != nullptr)
+        rt60MeasureThread->stopThread (2000);
+}
 
 void GrainReverb2AudioProcessorEditor::paint (juce::Graphics& g)
 {
@@ -120,12 +175,16 @@ void GrainReverb2AudioProcessorEditor::resized()
     auto bounds = getLocalBounds().reduced (10);
 
     auto buttonRow = bounds.removeFromTop (28);
-    rt60Readout.setBounds (buttonRow.removeFromRight (110).reduced (4, 2));
-    rt60Button.setBounds (buttonRow.removeFromRight (90).reduced (4, 2));
+    measureRt60Button.setBounds (buttonRow.removeFromRight (100).reduced (4, 2));
     const int w = buttonRow.getWidth() / 3;
     cutoffButton.setBounds (buttonRow.removeFromLeft (w).reduced (4, 2));
     qButton.setBounds (buttonRow.removeFromLeft (w).reduced (4, 2));
     tailButton.setBounds (buttonRow.reduced (4, 2));
+
+    // Own row, full width -- the diagnostic "(buf Xms, scat Y)" suffix
+    // added to this readout doesn't fit alongside the buttons above.
+    bounds.removeFromTop (4); // gap
+    rt60Readout.setBounds (bounds.removeFromTop (18));
 
     // Just visual breathing room below the button row -- the ACTUAL fix for
     // max-value points getting clipped is kVisualizerTopMargin, applied

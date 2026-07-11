@@ -22,10 +22,16 @@ private:
 
     juce::TextButton cutoffButton { "Cutoff" }, qButton { "Q" }, tailButton { "Tail" };
 
-    // On-demand RT60 estimate (cheap closed-form, PDF Section 2.6) -- not a
-    // live/continuous measurement, just a snapshot computed from the
-    // current params when clicked, shown in rt60Readout.
-    juce::TextButton rt60Button { "Calc RT60" };
+    // Empirical measurement: runs a throwaway GrainVoiceEngine on a
+    // background thread with an impulse + silence, faster than real time
+    // (processSample() has no wall-clock dependency), and measures the
+    // actual decay via Schroeder backward integration. See PluginEditor.cpp
+    // for the RT60MeasureThread that does the work. Stored as a
+    // juce::Thread base pointer -- the concrete subclass is defined
+    // entirely in the .cpp, this only ever needs start/stop/isRunning.
+    juce::TextButton measureRt60Button { "Measure RT60" };
+    std::unique_ptr<juce::Thread> rt60MeasureThread;
+
     juce::Label rt60Readout;
 
     // bufferVisualizer and breakpointEditor are given IDENTICAL bounds in
