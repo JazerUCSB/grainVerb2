@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "PaneTheme.h"
 
 namespace
 {
@@ -110,9 +111,9 @@ namespace
 
 GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2AudioProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p),
-      earlyBufferVisualizer (p, p.getEarlyEngine(), p.getEarlySharedState()),
+      earlyBufferVisualizer (p, p.getEarlyEngine(), p.getEarlySharedState(), kEarlyPaneColour),
       earlyBreakpointEditor (p, p.getEarlyEngine(), p.getEarlySharedState()),
-      lateBufferVisualizer (p, p.getLateEngine(), p.getLateSharedState()),
+      lateBufferVisualizer (p, p.getLateEngine(), p.getLateSharedState(), kLatePaneColour),
       lateBreakpointEditor (p, p.getLateEngine(), p.getLateSharedState()),
       dialsPanel (p)
 {
@@ -179,7 +180,13 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
 
     addAndMakeVisible (dialsPanel);
 
-    setSize (1120, 760); // wide enough for two full visualizer panes side by side
+    // Height trimmed from 760 to 620: the visualizer/breakpoint-editor pane
+    // is scaled to 66% of what it was (412px -> ~272px) -- everything else
+    // (button row, dials area, margins) is unchanged, so shrinking the
+    // window by exactly the freed 140px keeps resized()'s existing "give
+    // the visualizer whatever's left over" logic correct with no other
+    // changes needed there.
+    setSize (1120, 620);
 }
 
 GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor()

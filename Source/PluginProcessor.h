@@ -16,25 +16,23 @@ namespace ParamID
     static constexpr auto windowRangeMs = "windowRangeMs";
     static constexpr auto bufferLenMs   = "bufferLenMs";
     static constexpr auto feedback      = "feedback";
-    static constexpr auto readScatter   = "readScatter";
     static constexpr auto jitter        = "jitter";
     static constexpr auto dispersion    = "dispersion";
     static constexpr auto mix           = "mix";
-    static constexpr auto numGrainVoices = "numGrainVoices"; // 25-100, per-bank voice count
+    static constexpr auto numGrainVoices = "numGrainVoices"; // 50-200, per-bank voice count
 
     // Early reflections -- a second, smaller/faster-scaled instance of the
-    // same GrainVoiceEngine (fixed 1000ms/600ms buffers, no bufferLenMs/
-    // readScatter controls -- see PluginProcessor.cpp's syncParams()).
-    // Shares late's cutoff/Q/tail curve UI pattern but with its own
-    // independent curves, and its own fadeSamps/meanWindowMs/windowRangeMs/
-    // feedback/jitter/dispersion.
+    // same GrainVoiceEngine. Shares late's cutoff/Q/tail curve UI pattern
+    // but with its own independent curves, and its own bufferLenMs/
+    // fadeSamps/meanWindowMs/windowRangeMs/feedback/jitter/dispersion.
+    static constexpr auto earlyBufferLenMs   = "earlyBufferLenMs";
     static constexpr auto earlyFadeSamps     = "earlyFadeSamps";
     static constexpr auto earlyMeanWindowMs  = "earlyMeanWindowMs";
     static constexpr auto earlyWindowRangeMs = "earlyWindowRangeMs";
     static constexpr auto earlyFeedback      = "earlyFeedback";
     static constexpr auto earlyJitter        = "earlyJitter";
     static constexpr auto earlyDispersion    = "earlyDispersion";
-    static constexpr auto earlyNumGrainVoices = "earlyNumGrainVoices"; // 5-30, per-bank voice count
+    static constexpr auto earlyNumGrainVoices = "earlyNumGrainVoices"; // 30-100, per-bank voice count
 
     // Crossfades the early/late wet signals BEFORE the shared dry/wet mix
     // above is applied -- 0 = all late, 1 = all early.
@@ -108,10 +106,12 @@ private:
     GrainVoiceEngine lateEngine;
 
     // Early reflections: same engine/state classes, configured (in
-    // prepareToPlay()) with much smaller buffers (1000ms/600ms) and far
-    // fewer voices per bank (16 vs late's 200). No bufferLenMs/readScatter
-    // controls -- its del1/del2 are always fully active, matching how
-    // late's OWN del2 already has no scatter control (see syncParams()).
+    // prepareToPlay()) with much smaller MAXIMUM buffer capacity (1000ms/
+    // 600ms) and far fewer voices per bank than late. del1's ACTIVE length
+    // is user-adjustable (earlyBufferLenMs, up to that 1000ms capacity) the
+    // same way late's already is; readScatter is fixed at 1.0 for BOTH
+    // engines now (see syncParams()) -- del1Len IS the active read range,
+    // no separate scatter-limited subset within it.
     GrainReverbSharedState earlyShared;
     GrainVoiceEngine earlyEngine;
 
@@ -122,11 +122,11 @@ private:
     std::atomic<float>* windowRangeMsParam = nullptr;
     std::atomic<float>* bufferLenMsParam   = nullptr;
     std::atomic<float>* feedbackParam      = nullptr;
-    std::atomic<float>* readScatterParam   = nullptr;
     std::atomic<float>* jitterParam        = nullptr;
     std::atomic<float>* dispersionParam    = nullptr;
     std::atomic<float>* numGrainVoicesParam = nullptr;
 
+    std::atomic<float>* earlyBufferLenMsParam    = nullptr;
     std::atomic<float>* earlyFadeSampsParam      = nullptr;
     std::atomic<float>* earlyMeanWindowMsParam   = nullptr;
     std::atomic<float>* earlyWindowRangeMsParam  = nullptr;

@@ -20,8 +20,10 @@ namespace
 
 CircularBufferVisualizer::CircularBufferVisualizer (GrainReverb2AudioProcessor& processorForSampleRate,
                                                       const GrainVoiceEngine& engineToShow,
-                                                      const GrainReverbSharedState& stateToShow)
-    : processor (processorForSampleRate), engine (engineToShow), sharedState (stateToShow)
+                                                      const GrainReverbSharedState& stateToShow,
+                                                      juce::Colour backgroundColourToUse)
+    : processor (processorForSampleRate), engine (engineToShow), sharedState (stateToShow),
+      backgroundColour (backgroundColourToUse)
 {
     // 24fps rather than 30 -- extra headroom now that this repaints both
     // channels' worth of buffer-scan work instead of one.
@@ -40,7 +42,7 @@ void CircularBufferVisualizer::timerCallback()
 
 void CircularBufferVisualizer::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colours::black);
+    g.fillAll (backgroundColour);
 
     const auto& bufL = engine.getDelayBuffer1 (0);
     const auto& bufR = engine.getDelayBuffer1 (1);
@@ -52,6 +54,10 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
         return;
 
     const double del1Len = std::floor ((params.bufferLenMs / (engine.getDel1MaxSeconds() * 1000.0)) * (double) bufL.size());
+    // readScatter is now always 1.0 (see GrainReverbParams::readScatter) --
+    // this equals del1Len exactly, i.e. the FULL active buffer, which is
+    // what makes labeling the axis "Buffer Length" below accurate rather
+    // than an overclaim.
     const double readSpan = juce::jmax (1.0, params.readScatter * del1Len);
     const double maxSeconds = readSpan / sampleRate;
 
@@ -137,20 +143,28 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     const auto rulerWaveformX = topArea.toFloat().getX();
     const auto rulerWaveformWidth = topArea.toFloat().getWidth();
 
-    // Axis caption in the bottom-left corner -- below the left margin, in
-    // the ruler row -- which is otherwise always blank (neither the
-    // waveform loop above nor BreakpointEditor's identical margin math ever
-    // draws there), so this can't collide with or shift anything else's
-    // alignment. Deliberately "Read Span," not "Buffer Length" -- the axis
-    // spans readSpan = readScatter * bufferLenMs, NOT the full buffer
-    // length (e.g. at the 0.9 default scatter, a 4000ms buffer's rightmost
-    // tick reads 3.6s, not 4.0s) -- "Buffer Length" overclaimed what's
-    // actually shown here.
-    g.setColour (juce::Colours::grey);
-    g.setFont (10.0f);
-    g.drawText ("Read Span",
-                juce::Rectangle<float> (0.0f, (float) rulerArea.getY(), (float) kVisualizerLeftMargin, (float) rulerArea.getHeight()),
-                juce::Justification::centred);
+    // Axis caption badge in the bottom-left corner -- below the left
+    // margin, in the ruler row -- which is otherwise always blank (neither
+    // the waveform loop above nor BreakpointEditor's identical margin math
+    // ever draws there), so this can't collide with or shift anything
+    // else's alignment. Now genuinely "Buffer Length" (not "Read Span"):
+    // readScatter is pinned to 1.0 for both engines (see
+    // GrainReverbParams::readScatter), so readSpan == del1Len == the full
+    // active buffer exactly -- no longer an overclaim. Drawn as a filled,
+    // outlined badge rather than plain text so it reads as a clearly
+    // labeled axis, not just incidental grey text in a corner.
+    {
+        auto badgeArea = juce::Rectangle<float> (2.0f, (float) rulerArea.getY() + 2.0f,
+                                                   (float) kVisualizerLeftMargin - 4.0f, (float) rulerArea.getHeight() - 4.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.6f));
+        g.fillRoundedRectangle (badgeArea, 4.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.8f));
+        g.drawRoundedRectangle (badgeArea, 4.0f, 1.2f);
+
+        g.setColour (juce::Colours::white);
+        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        g.drawText ("Buffer Length", badgeArea, juce::Justification::centred);
+    }
 
     constexpr int numTicks = 5;
     for (int i = 0; i < numTicks; ++i)

@@ -5,8 +5,14 @@
 // BreakpointEditor is overlaid on top of the waveform (Step 7/8). Keeping
 // these in one place instead of duplicating literals in both files avoids
 // the two silently drifting out of alignment if either changes.
-inline constexpr int kVisualizerLeftMargin = 40; // reserved for y-axis value labels
-inline constexpr int kVisualizerRulerHeight = 20; // reserved for the x-axis (seconds) ruler
+// Widened (40->72) to fit the "Buffer Length" axis-caption badge
+// (CircularBufferVisualizer's bottom-left corner) at a legible size --
+// this margin also holds BreakpointEditor's own value labels, which
+// benefit from the extra room too.
+inline constexpr int kVisualizerLeftMargin = 72; // reserved for y-axis value labels
+// Heightened (20->26) alongside the margin widening above, for the same
+// "Buffer Length" badge's vertical room.
+inline constexpr int kVisualizerRulerHeight = 26; // reserved for the x-axis (seconds) ruler
 
 // A point/handle sitting exactly at the plot's maximum value (e.g.
 // cutoff's 20kHz ceiling) is drawn as a circle CENTERED on that pixel --

@@ -32,7 +32,14 @@ struct GrainReverbParams
     double windowRangeMs = 50.0;
     double bufferLenMs   = 4000.0;
     double fb            = 0.5;
-    double readScatter   = 0.9;
+
+    // No dial anywhere any more -- PluginProcessor::syncParams() always
+    // pins this to 1.0 for both engines (bufferLenMs alone controls how
+    // much of del1's fixed capacity is active/scatterable; the two dials
+    // were redundant once grain reads are safely clamped against the
+    // write head). Kept as a field rather than deleted since
+    // GrainVoiceEngine's readSpan formula still multiplies by it.
+    double readScatter   = 1.0;
     double jitter        = 0.0;
 
     // Not part of the gen~ patch (which is mono) -- this is our own control

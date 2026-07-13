@@ -36,10 +36,12 @@ public:
     // every engine in the plugin); engineToShow/stateToShow point at
     // whichever specific engine/params this instance should visualize --
     // late or early reflections both use this same class, just constructed
-    // with different references.
+    // with different references. backgroundColourToUse is the pane's own
+    // colourway (see PaneTheme.h) instead of a hardcoded black fill.
     CircularBufferVisualizer (GrainReverb2AudioProcessor& processorForSampleRate,
                                const GrainVoiceEngine& engineToShow,
-                               const GrainReverbSharedState& stateToShow);
+                               const GrainReverbSharedState& stateToShow,
+                               juce::Colour backgroundColourToUse);
     ~CircularBufferVisualizer() override;
 
     void paint (juce::Graphics&) override;
@@ -50,6 +52,7 @@ private:
     GrainReverb2AudioProcessor& processor;
     const GrainVoiceEngine& engine;
     const GrainReverbSharedState& sharedState;
+    juce::Colour backgroundColour;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CircularBufferVisualizer)
 };

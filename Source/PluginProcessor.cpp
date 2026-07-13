@@ -37,9 +37,11 @@ namespace
             [] (float v, int) { return juce::String ((juce::int64) std::round (v)) + " grains"; });
     }
 
-    // Early reflections' fixed sizing -- no user-adjustable bufferLenMs/
-    // readScatter (see ParamID::earlyFadeSamps and friends' comment), so
-    // these are the only place these numbers live.
+    // MAXIMUM capacity for each engine's del1 -- earlyBufferLenMs/
+    // bufferLenMs dials pick the ACTIVE portion within this (see
+    // GrainVoiceEngine::seedGrains()'s del1Len formula), never resized
+    // after prepare(). del2 has no dial at all for either engine -- always
+    // fully active at its own fixed capacity.
     constexpr double kEarlyDel1MaxSeconds = 1.0; // 1000ms
     constexpr double kEarlyDel2MaxSeconds = 0.6; // 600ms
 
@@ -49,8 +51,8 @@ namespace
     // sample (GrainReverbParams::numGrainVoices); the allocation itself
     // never changes after prepare(), so moving the dial can't reallocate on
     // the audio thread.
-    constexpr int kLateMaxVoicesPerBank  = 100;
-    constexpr int kEarlyMaxVoicesPerBank = 30;
+    constexpr int kLateMaxVoicesPerBank  = 200;
+    constexpr int kEarlyMaxVoicesPerBank = 100;
 }
 
 GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
@@ -66,12 +68,12 @@ GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
     windowRangeMsParam = apvts.getRawParameterValue (ParamID::windowRangeMs);
     bufferLenMsParam   = apvts.getRawParameterValue (ParamID::bufferLenMs);
     feedbackParam      = apvts.getRawParameterValue (ParamID::feedback);
-    readScatterParam   = apvts.getRawParameterValue (ParamID::readScatter);
     jitterParam        = apvts.getRawParameterValue (ParamID::jitter);
     dispersionParam    = apvts.getRawParameterValue (ParamID::dispersion);
     mixParam           = apvts.getRawParameterValue (ParamID::mix);
     numGrainVoicesParam = apvts.getRawParameterValue (ParamID::numGrainVoices);
 
+    earlyBufferLenMsParam    = apvts.getRawParameterValue (ParamID::earlyBufferLenMs);
     earlyFadeSampsParam      = apvts.getRawParameterValue (ParamID::earlyFadeSamps);
     earlyMeanWindowMsParam   = apvts.getRawParameterValue (ParamID::earlyMeanWindowMs);
     earlyWindowRangeMsParam  = apvts.getRawParameterValue (ParamID::earlyWindowRangeMs);
@@ -92,72 +94,38 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
 
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
-    // Ranges/defaults match the PDF's Section 4.3 table (gen~'s Param
-    // declarations), except dispersion and mix, which don't exist in the
-    // gen~ patch -- dispersion is our per-grain stereo pan-spread control
-    // (see GrainVoiceEngine), mix is a plain wet/dry blend applied in
-    // processBlock.
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::fadeSamps, 1 }, "Fade (samples)",
-        Range { 3.0f, 4800.0f }, 200.0f, sampsUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::meanWindowMs, 1 }, "Grain Size (ms)",
-        Range { 1.0f, 3000.0f }, 200.0f, msUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::windowRangeMs, 1 }, "Grain Size Variance (ms)",
-        Range { 1.0f, 3000.0f }, 50.0f, msUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::bufferLenMs, 1 }, "Buffer Length (ms)",
-        Range { 500.0f, 6000.0f }, 4000.0f, msUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::feedback, 1 }, "Feedback",
-        Range { 0.0f, 0.999f }, 0.5f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::readScatter, 1 }, "Read Scatter",
-        Range { 0.1f, 1.0f }, 1.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::jitter, 1 }, "Rate Jitter",
-        Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::dispersion, 1 }, "Stereo Dispersion",
-        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::mix, 1 }, "Mix",
-        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::numGrainVoices, 1 }, "Number of Grains",
-        Range { 25.0f, 100.0f }, 100.0f, grainsUnitAttrs()));
+    // Takes the prefix ONCE per engine instead of retyping "Late "/"Early "
+    // into every display-name string -- guarantees consistent formatting
+    // and lets matching early/late pairs be written side by side below.
+    auto addParam = [&params] (const char* id, const juce::String& prefix, const juce::String& baseName,
+                                Range range, float def, juce::AudioParameterFloatAttributes attrs)
+    {
+        params.push_back (std::make_unique<Param> (juce::ParameterID { id, 1 }, prefix + baseName, range, def, attrs));
+    };
 
-    // Early reflections -- own fadeSamps/grain size/variance/feedback/
-    // jitter/dispersion, but no bufferLenMs/readScatter: its del1/del2 are
-    // always fully active (fixed 1000ms/600ms, set in prepareToPlay()/
-    // syncParams()), the same way late's OWN del2 has no scatter control.
-    // Defaults for grain size/variance match the 1000ms buffer's spec
-    // (100ms grains, 25ms variance); the 600ms buffer's smaller 50ms/15ms
-    // grains aren't separately controllable -- one shared dial set governs
-    // both of early's banks, exactly like late's meanWindowMs/windowRangeMs
-    // already governs both del1 and del2 today.
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyFadeSamps, 1 }, "Early Fade (samples)",
-        Range { 3.0f, 2000.0f }, 100.0f, sampsUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyMeanWindowMs, 1 }, "Early Grain Size (ms)",
-        Range { 1.0f, 500.0f }, 100.0f, msUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyWindowRangeMs, 1 }, "Early Grain Size Variance (ms)",
-        Range { 1.0f, 200.0f }, 25.0f, msUnitAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyFeedback, 1 }, "Early Feedback",
-        Range { 0.0f, 0.999f }, 0.3f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyJitter, 1 }, "Early Rate Jitter",
-        Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyDispersion, 1 }, "Early Stereo Dispersion",
-        Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
-    params.push_back (std::make_unique<Param> (
-        juce::ParameterID { ParamID::earlyNumGrainVoices, 1 }, "Early Number of Grains",
-        Range { 5.0f, 30.0f }, 16.0f, grainsUnitAttrs()));
+    // No readScatter for EITHER engine any more -- it's pinned to 1.0 in
+    // syncParams(), so bufferLenMs alone controls how much of del1's fixed
+    // capacity is active (see kEarlyDel1MaxSeconds's comment above). del2
+    // still has no dial for either engine -- always fully active at its
+    // own fixed capacity.
+    addParam (ParamID::bufferLenMs,      "Late ",  "Buffer Length (ms)",       Range { 200.0f, 6000.0f }, 3500.0f, msUnitAttrs());
+    addParam (ParamID::earlyBufferLenMs, "Early ", "Buffer Length (ms)",       Range { 50.0f, 1000.0f },  200.0f,  msUnitAttrs());
+    addParam (ParamID::feedback,         "Late ",  "Feedback",                 Range { 0.0f, 0.999f },    0.5f,    plain3DecimalAttrs());
+    addParam (ParamID::earlyFeedback,    "Early ", "Feedback",                 Range { 0.0f, 0.999f },    0.5f,    plain3DecimalAttrs());
+    addParam (ParamID::numGrainVoices,      "Late ",  "Number of Grains",      Range { 50.0f, 200.0f },   100.0f,  grainsUnitAttrs());
+    addParam (ParamID::earlyNumGrainVoices, "Early ", "Number of Grains",      Range { 30.0f, 100.0f },   50.0f,   grainsUnitAttrs());
+    addParam (ParamID::meanWindowMs,      "Late ",  "Grain Size (ms)",         Range { 50.0f, 2000.0f },  200.0f,  msUnitAttrs());
+    addParam (ParamID::earlyMeanWindowMs, "Early ", "Grain Size (ms)",         Range { 50.0f, 500.0f },   100.0f,  msUnitAttrs());
+    addParam (ParamID::windowRangeMs,      "Late ",  "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  50.0f,   msUnitAttrs());
+    addParam (ParamID::earlyWindowRangeMs, "Early ", "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  25.0f,   msUnitAttrs());
+    addParam (ParamID::fadeSamps,      "Late ",  "Fade (samples)",             Range { 5.0f, 1000.0f },   200.0f,  sampsUnitAttrs());
+    addParam (ParamID::earlyFadeSamps, "Early ", "Fade (samples)",             Range { 5.0f, 1000.0f },   200.0f,  sampsUnitAttrs());
+    addParam (ParamID::jitter,      "Late ",  "Rate Jitter", Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs());
+    addParam (ParamID::earlyJitter, "Early ", "Rate Jitter", Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs());
+    addParam (ParamID::dispersion,      "Late ",  "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
+    addParam (ParamID::earlyDispersion, "Early ", "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
+    addParam (ParamID::mix, "Late ", "Mix", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()); // no early equivalent -- shared via Balance instead
+
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::balance, 1 }, "Early/Late Balance",
         Range { 0.0f, 1.0f }, 0.5f, plain3DecimalAttrs()));
@@ -173,12 +141,20 @@ void GrainReverb2AudioProcessor::syncParams()
     p.windowRangeMs = (double) windowRangeMsParam->load();
     p.bufferLenMs   = (double) bufferLenMsParam->load();
     p.fb            = (double) feedbackParam->load();
-    p.readScatter   = (double) readScatterParam->load();
     p.jitter        = (double) jitterParam->load();
     p.dispersion    = (double) dispersionParam->load();
     p.numGrainVoices = (double) numGrainVoicesParam->load();
+    // No dial any more -- pinned at 1.0 for both engines. There's no
+    // longer a meaningful difference between "how much of the buffer is
+    // active" (bufferLenMs) and "how far across the active buffer can
+    // grains scatter" (readScatter) once grain read positions are safely
+    // clamped against the write head (clampReadAgainstWriteHead) -- the two
+    // dials were redundant, so bufferLenMs alone now controls del1's
+    // active/scatter range.
+    p.readScatter   = 1.0;
 
     auto& ep = earlyShared.params;
+    ep.bufferLenMs   = (double) earlyBufferLenMsParam->load();
     ep.fadeSamps     = (double) earlyFadeSampsParam->load();
     ep.meanWindowMs  = (double) earlyMeanWindowMsParam->load();
     ep.windowRangeMs = (double) earlyWindowRangeMsParam->load();
@@ -186,12 +162,6 @@ void GrainReverb2AudioProcessor::syncParams()
     ep.jitter        = (double) earlyJitterParam->load();
     ep.dispersion    = (double) earlyDispersionParam->load();
     ep.numGrainVoices = (double) earlyNumGrainVoicesParam->load();
-    // No dial for these -- early's del1/del2 are always fully active (see
-    // the ParamID::earlyFadeSamps comment), matching how del1Len/readSpan
-    // are computed: bufferLenMs at its own max (del1MaxSeconds*1000) and
-    // readScatter at 1.0 mean del1Len == del1L.size() and readSpan ==
-    // del1Len, i.e. no scatter-limited subset, ever.
-    ep.bufferLenMs   = kEarlyDel1MaxSeconds * 1000.0;
     ep.readScatter   = 1.0;
 }
 
