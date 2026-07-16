@@ -5,6 +5,8 @@
 #include "CircularBufferVisualizer.h"
 #include "BreakpointEditor.h"
 #include "ParamDialsPanel.h"
+#include "TabButtonLookAndFeel.h"
+#include "Rt60ButtonLookAndFeel.h"
 
 // The editor is the plugin's GUI. It holds a reference back to the
 // processor so it can read/write parameters -- it never owns DSP state.
@@ -36,8 +38,15 @@ private:
     juce::Label earlyReflectionsLabel;
     juce::Label lateReflectionsLabel;
 
+    // Styled like browser tabs (see TabButtonLookAndFeel) -- the selected
+    // one fills with its own side's pane colour and has no bottom border,
+    // reading as flush with the visualizer below; unselected ones are grey
+    // with a bottom border marking them inactive. Set on all 6 (not
+    // app-wide), reset to nullptr in the destructor before
+    // tabButtonLookAndFeel itself is destroyed.
     juce::TextButton earlyCutoffButton { "Cutoff" }, earlyQButton { "Q" }, earlyTailButton { "Tail" };
     juce::TextButton lateCutoffButton { "Cutoff" }, lateQButton { "Q" }, lateTailButton { "Tail" };
+    TabButtonLookAndFeel tabButtonLookAndFeel;
 
     // Empirical measurement: runs a throwaway GrainVoiceEngine on a
     // background thread with an impulse + silence, faster than real time
@@ -49,7 +58,11 @@ private:
     // Tied to LATE reflections only (its defaults match late's own
     // 200-voice/6s-1s sizing) -- early reflections doesn't get its own
     // measurement button, at least for now.
-    juce::TextButton measureRt60Button { "Measure RT60" };
+    // Text has an explicit line break -- this now lives in the narrow
+    // black margin beside the dial grid (see resized()), not the wide
+    // button row it used to share with the Cutoff/Q/Tail tabs.
+    juce::TextButton measureRt60Button { "Measure\nRT60" };
+    Rt60ButtonLookAndFeel rt60ButtonLookAndFeel;
     std::unique_ptr<juce::Thread> rt60MeasureThread;
     juce::Label rt60Readout;
 

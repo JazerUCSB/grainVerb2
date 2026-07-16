@@ -98,6 +98,19 @@ GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
     lateGainDbParam          = apvts.getRawParameterValue (ParamID::lateGainDb);
     predelayMsParam          = apvts.getRawParameterValue (ParamID::predelayMs);
 
+    // Early's cutoff/tail curve defaults differ from late's default
+    // construction (see GrainReverbSharedState's constructor for late's
+    // own 10k->500Hz cutoff / 1.0->exp(-6) tail): a brighter, narrower
+    // cutoff sweep (20k -> 10k) and a tail that only dips to 0.75 rather
+    // than decaying to ~0 -- early reflections shouldn't fade out the way
+    // a long late tail does. Set here (before prepare() ever bakes lookup
+    // tables from these points) rather than in GrainReverbSharedState's
+    // own constructor, since that's shared by both engines.
+    earlyShared.cutoffCurve.points = { { 0.0, 20000.0, CurveInterpolation::Linear },
+                                        { 1.0, 10000.0, CurveInterpolation::Linear } };
+    earlyShared.tailCurve.points = { { 0.0, 1.0,  CurveInterpolation::Exponential, -6.0 },
+                                      { 1.0, 0.75, CurveInterpolation::Linear,       4.0 } };
+
     // No allocation here otherwise -- sample rate isn't known yet. Real
     // DSP setup happens in prepareToPlay().
 }
@@ -132,7 +145,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     // this range without anything breaking (see GrainVoiceEngine's
     // read-anchor invariant). "Buffer Length" implied the latter and was
     // genuinely confusing once Grain Size could exceed it.
-    addParam (ParamID::bufferLenMs,      "Late ",  "Read Range (ms)",       Range { 200.0f, 6000.0f }, 3500.0f, msUnitAttrs());
+    addParam (ParamID::bufferLenMs,      "Late ",  "Read Range (ms)",       Range { 200.0f, 6000.0f }, 2500.0f, msUnitAttrs());
     // Range dropped to 25-400ms (was 50-1000ms) -- see kEarlyDel1MaxSeconds
     // below, shrunk to match. Default stays 50ms + Grain Size default
     // 200ms below: grain size 4x the buffer range collapses each grain
@@ -142,7 +155,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     // multi-tap early-reflections generator than a churning granular
     // cloud -- this was found by ear to be the best match against a
     // reference ER plugin.
-    addParam (ParamID::earlyBufferLenMs, "Early ", "Read Range (ms)",       Range { 25.0f, 400.0f },  50.0f,   msUnitAttrs());
+    addParam (ParamID::earlyBufferLenMs, "Early ", "Read Range (ms)",       Range { 25.0f, 400.0f },  100.0f,   msUnitAttrs());
     addParam (ParamID::feedback,         "Late ",  "Feedback",                 Range { 0.0f, 0.999f },    0.5f,    plain3DecimalAttrs());
     // Early used to split this into two dials (Feedback 1/2 -- write-only
     // bank vs. listen bank, singleBufferDualFeedback's two loops into the
@@ -154,16 +167,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     addParam (ParamID::earlyFeedback,    "Early ", "Feedback",                 Range { 0.0f, 0.999f },    0.1f,    plain3DecimalAttrs());
     addParam (ParamID::numGrainVoices,      "Late ",  "Number of Grains",      Range { 50.0f, 200.0f },   100.0f,  grainsUnitAttrs());
     addParam (ParamID::earlyNumGrainVoices, "Early ", "Number of Grains",      Range { 30.0f, 100.0f },   50.0f,   grainsUnitAttrs());
-    addParam (ParamID::meanWindowMs,      "Late ",  "Grain Size (ms)",         Range { 50.0f, 2000.0f },  200.0f,  msUnitAttrs());
-    addParam (ParamID::earlyMeanWindowMs, "Early ", "Grain Size (ms)",         Range { 50.0f, 500.0f },   200.0f,  msUnitAttrs());
-    addParam (ParamID::windowRangeMs,      "Late ",  "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  50.0f,   msUnitAttrs());
-    addParam (ParamID::earlyWindowRangeMs, "Early ", "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  25.0f,   msUnitAttrs());
-    addParam (ParamID::fadeSamps,      "Late ",  "Fade (samples)",             Range { 5.0f, 1000.0f },   200.0f,  sampsUnitAttrs());
+    addParam (ParamID::meanWindowMs,      "Late ",  "Grain Size (ms)",         Range { 50.0f, 2000.0f },  350.0f,  msUnitAttrs());
+    addParam (ParamID::earlyMeanWindowMs, "Early ", "Grain Size (ms)",         Range { 50.0f, 500.0f },   300.0f,  msUnitAttrs());
+    addParam (ParamID::windowRangeMs,      "Late ",  "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  75.0f,   msUnitAttrs());
+    addParam (ParamID::earlyWindowRangeMs, "Early ", "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  60.0f,   msUnitAttrs());
+    addParam (ParamID::fadeSamps,      "Late ",  "Fade (samples)",             Range { 5.0f, 1000.0f },   300.0f,  sampsUnitAttrs());
     addParam (ParamID::earlyFadeSamps, "Early ", "Fade (samples)",             Range { 5.0f, 1000.0f },   200.0f,  sampsUnitAttrs());
-    addParam (ParamID::jitter,      "Late ",  "Rate Jitter", Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs());
-    addParam (ParamID::earlyJitter, "Early ", "Rate Jitter", Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs());
+    addParam (ParamID::jitter,      "Late ",  "Rate Jitter", Range { 0.0f, 0.1f }, 0.002f, plain3DecimalAttrs());
+    addParam (ParamID::earlyJitter, "Early ", "Rate Jitter", Range { 0.0f, 0.1f }, 0.002f, plain3DecimalAttrs());
     addParam (ParamID::dispersion,      "Late ",  "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
-    addParam (ParamID::earlyDispersion, "Early ", "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
+    addParam (ParamID::earlyDispersion, "Early ", "Stereo Dispersion", Range { 0.0f, 1.0f }, 0.0f, plain3DecimalAttrs());
     // Renamed from "Late Mix" -- it's a post-balance blend of BOTH
     // engines' combined output (applied in processBlock() after early/late
     // are already crossfaded together), not a late-only control; the old
@@ -278,12 +291,34 @@ void GrainReverb2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         const double dryL = (double) left[i];
         const double dryR = (double) right[i];
 
-        // Parallel, not series: both engines process the SAME dry input
-        // independently, each with its own del1/del2 feedback loop -- two
-        // self-contained reverb tanks running side by side, crossfaded by
-        // balance rather than one feeding the other.
+        // Series, not parallel: early runs FIRST, and its output is added
+        // to the dry input feeding late below, instead of both engines
+        // independently processing the same dry input side by side. Early
+        // reflections now feed directly into late's buffer at its write
+        // head, the way a real early-reflections stage feeds a late
+        // reverb tank.
+        //
+        // Early's audible bank shares del1 with the write bank, so it
+        // reads the raw dry input directly into the very buffer it's
+        // reading -- the exact structural gap that makes hot input drive
+        // coherent-overshoot-based distortion in GrainVoiceEngine's tanh
+        // safety net (see its comment). Scaling the input down before it
+        // ever reaches early's engine reduces how much energy builds up
+        // in that shared buffer/feedback loop in the first place --
+        // fixing the overshoot at its source instead of trying to patch
+        // it after the fact downstream.
+        constexpr double kEarlyInputScale = 0.25;
+        double earlyWetL = 0.0, earlyWetR = 0.0;
+        earlyEngine.processSample (dryL * kEarlyInputScale, dryR * kEarlyInputScale, earlyShared, earlyWetL, earlyWetR);
+        earlyWetL *= earlyGainLin;
+        earlyWetR *= earlyGainLin;
+
+        // Late receives dry + early's own output as its input -- written
+        // into late's buffer at its write head right alongside the dry
+        // signal, so late's tank accumulates early's reflections as part
+        // of what it reads back and feeds forward.
         double lateWetL = 0.0, lateWetR = 0.0;
-        lateEngine.processSample (dryL, dryR, lateShared, lateWetL, lateWetR);
+        lateEngine.processSample (dryL + earlyWetL, dryR + earlyWetR, lateShared, lateWetL, lateWetR);
 
         // Late's audible bank (Bank 2, reading del2) never receives the
         // dry input directly -- only fb*(aud1+aud2), feedback that's
@@ -301,23 +336,11 @@ void GrainReverb2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         lateWetL *= lateGainLin;
         lateWetR *= lateGainLin;
 
-        // Early's audible bank shares del1 with the write bank, so it
-        // reads the raw dry input directly into the very buffer it's
-        // reading -- the exact structural gap that makes hot input drive
-        // coherent-overshoot-based distortion in GrainVoiceEngine's tanh
-        // safety net (see its comment). Scaling the input down before it
-        // ever reaches early's engine reduces how much energy builds up
-        // in that shared buffer/feedback loop in the first place --
-        // fixing the overshoot at its source instead of trying to patch
-        // it after the fact downstream.
-        constexpr double kEarlyInputScale = 0.25;
-        double earlyWetL = 0.0, earlyWetR = 0.0;
-        earlyEngine.processSample (dryL * kEarlyInputScale, dryR * kEarlyInputScale, earlyShared, earlyWetL, earlyWetR);
-        earlyWetL *= earlyGainLin;
-        earlyWetR *= earlyGainLin;
-
         // 0 = all early, 1 = all late (matches the Balance dial's "Early"/
-        // "Late" low/high labels in ParamDialsPanel).
+        // "Late" low/high labels in ParamDialsPanel). lateWetL/R now
+        // already carries early's contribution too (see above), so this
+        // crossfade is "raw early tap" vs. "early having passed through
+        // late's tank as well," not two fully independent signals.
         const double wetL = earlyWetL * (1.0 - balance) + lateWetL * balance;
         const double wetR = earlyWetR * (1.0 - balance) + lateWetR * balance;
 
