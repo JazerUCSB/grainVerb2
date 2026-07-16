@@ -16,6 +16,17 @@ namespace
             r += n;
         return (size_t) r;
     }
+
+    // Display-only amplitude boost -- sqrt curve maps [-1, 1] to itself
+    // (0 stays 0, +-1 stays +-1) while disproportionately stretching
+    // near-zero values (e.g. sqrt(0.01) = 0.1, a 10x visual boost for a 1%
+    // amplitude signal), so quiet passages are actually visible in the
+    // waveform without touching the real audio or clipping loud ones past
+    // the +-1 ceiling they already can't exceed.
+    double visualAmplitudeBoost (double v)
+    {
+        return v >= 0.0 ? std::sqrt (v) : -std::sqrt (-v);
+    }
 }
 
 CircularBufferVisualizer::CircularBufferVisualizer (GrainReverb2AudioProcessor& processorForSampleRate,
@@ -56,7 +67,7 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     const double del1Len = std::floor ((params.bufferLenMs / (engine.getDel1MaxSeconds() * 1000.0)) * (double) bufL.size());
     // readScatter is now always 1.0 (see GrainReverbParams::readScatter) --
     // this equals del1Len exactly, i.e. the FULL active buffer, which is
-    // what makes labeling the axis "Buffer Length" below accurate rather
+    // what makes labeling the axis "Read Range" below accurate rather
     // than an overclaim.
     const double readSpan = juce::jmax (1.0, params.readScatter * del1Len);
     const double maxSeconds = readSpan / sampleRate;
@@ -69,6 +80,7 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     // Also doubles as room for the L/R tags drawn per channel below.
     auto leftMarginArea = bounds.removeFromLeft (kVisualizerLeftMargin);
     bounds.removeFromTop (kVisualizerTopMargin); // headroom so a max-value point isn't top-clipped
+    bounds.removeFromRight (kVisualizerRightMargin); // ditto for a point at dn = 1 (far right)
 
     // Stacked L (top) / R (bottom) instead of a toggle -- with per-grain
     // panning inside one merged engine, neither channel alone shows the
@@ -115,6 +127,8 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
                 hi = juce::jmax (hi, v);
             }
             if (lo > hi) { lo = 0.0; hi = 0.0; } // guard against a degenerate empty span
+            lo = visualAmplitudeBoost (lo);
+            hi = visualAmplitudeBoost (hi);
 
             const float xPix = area.getX() + (float) x;
             g.drawVerticalLine ((int) xPix, midY - (float) hi * halfH, midY - (float) lo * halfH);
@@ -143,27 +157,28 @@ void CircularBufferVisualizer::paint (juce::Graphics& g)
     const auto rulerWaveformX = topArea.toFloat().getX();
     const auto rulerWaveformWidth = topArea.toFloat().getWidth();
 
-    // Axis caption badge in the bottom-left corner -- below the left
-    // margin, in the ruler row -- which is otherwise always blank (neither
-    // the waveform loop above nor BreakpointEditor's identical margin math
-    // ever draws there), so this can't collide with or shift anything
-    // else's alignment. Now genuinely "Buffer Length" (not "Read Span"):
-    // readScatter is pinned to 1.0 for both engines (see
+    // Axis caption in the bottom-left corner -- below the left margin, in
+    // the ruler row -- which is otherwise always blank (neither the
+    // waveform loop above nor BreakpointEditor's identical margin math ever
+    // draws there), so this can't collide with or shift anything else's
+    // alignment. Now genuinely "Read Range" (not "Read Span" or "Buffer
+    // Length" -- renamed since a grain reading position is a fixed delay
+    // TAP somewhere within this range, not a container a grain has to fit
+    // inside): readScatter is pinned to 1.0 for both engines (see
     // GrainReverbParams::readScatter), so readSpan == del1Len == the full
-    // active buffer exactly -- no longer an overclaim. Drawn as a filled,
-    // outlined badge rather than plain text so it reads as a clearly
-    // labeled axis, not just incidental grey text in a corner.
+    // active range exactly -- no longer an overclaim. Two lines
+    // (drawFittedText wraps "Buffer"/"Range" onto their own line each --
+    // kVisualizerRulerHeight is sized to fit both) rather than one, so the
+    // caption stays readable at this width. No background panel -- text
+    // drawn straight over the ruler row.
     {
         auto badgeArea = juce::Rectangle<float> (2.0f, (float) rulerArea.getY() + 2.0f,
                                                    (float) kVisualizerLeftMargin - 4.0f, (float) rulerArea.getHeight() - 4.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.6f));
-        g.fillRoundedRectangle (badgeArea, 4.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.8f));
-        g.drawRoundedRectangle (badgeArea, 4.0f, 1.2f);
-
         g.setColour (juce::Colours::white);
-        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
-        g.drawText ("Buffer Length", badgeArea, juce::Justification::centred);
+        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+        g.drawFittedText ("Read Range",
+                           { (int) badgeArea.getX(), (int) badgeArea.getY(), (int) badgeArea.getWidth(), (int) badgeArea.getHeight() },
+                           juce::Justification::centred, 2);
     }
 
     constexpr int numTicks = 5;

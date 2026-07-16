@@ -31,7 +31,17 @@ struct GrainReverbParams
     double meanWindowMs  = 200.0;
     double windowRangeMs = 50.0;
     double bufferLenMs   = 4000.0;
-    double fb            = 0.5;
+    double fb            = 0.5; // fb1 -- the write-only bank's feedback into the shared buffer
+
+    // Only meaningful for an engine prepared with singleBufferDualFeedback
+    // (currently just earlyEngine, see GrainVoiceEngine::prepare()) -- the
+    // listen-only bank's OWN feedback contribution into that same shared
+    // buffer. Unused (and harmless) for an engine prepared without that
+    // flag, e.g. lateEngine, which never reads this field. PluginProcessor::
+    // syncParams() mirrors this from fb every block (one UI dial, ParamID::
+    // earlyFeedback, now drives both -- a separate Feedback 2 dial was
+    // audibly indistinguishable from Feedback 1).
+    double fb2           = 0.5;
 
     // No dial anywhere any more -- PluginProcessor::syncParams() always
     // pins this to 1.0 for both engines (bufferLenMs alone controls how
@@ -41,6 +51,13 @@ struct GrainReverbParams
     // GrainVoiceEngine's readSpan formula still multiplies by it.
     double readScatter   = 1.0;
     double jitter        = 0.0;
+
+    // Shared across both engines (PluginProcessor::syncParams() writes
+    // the SAME value into both lateShared.params and earlyShared.params)
+    // -- pushes the nearest edge of every grain's readable range back by
+    // this many ms, so nothing reads closer to the write head than
+    // predelayMs allows. See GrainVoiceEngine::clampReadAgainstWriteHead().
+    double predelayMs    = 0.0;
 
     // Not part of the gen~ patch (which is mono) -- this is our own control
     // for per-grain output placement (GrainVoiceEngine::computePanGains):

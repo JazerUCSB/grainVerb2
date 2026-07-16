@@ -117,6 +117,16 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
       lateBreakpointEditor (p, p.getLateEngine(), p.getLateSharedState()),
       dialsPanel (p)
 {
+    addAndMakeVisible (earlyReflectionsLabel);
+    earlyReflectionsLabel.setText ("Early Reflections", juce::dontSendNotification);
+    earlyReflectionsLabel.setJustificationType (juce::Justification::centred);
+    earlyReflectionsLabel.setFont (juce::FontOptions (16.0f, juce::Font::bold));
+
+    addAndMakeVisible (lateReflectionsLabel);
+    lateReflectionsLabel.setText ("Late Reflections", juce::dontSendNotification);
+    lateReflectionsLabel.setJustificationType (juce::Justification::centred);
+    lateReflectionsLabel.setFont (juce::FontOptions (16.0f, juce::Font::bold));
+
     // Separate radio groups per side -- early's curve-select buttons must
     // not deselect late's, and vice versa.
     constexpr int earlyRadioGroupId = 2001;
@@ -168,25 +178,16 @@ GrainReverb2AudioProcessorEditor::GrainReverb2AudioProcessorEditor (GrainReverb2
     addAndMakeVisible (lateBufferVisualizer);
     addAndMakeVisible (lateBreakpointEditor);
 
-    addAndMakeVisible (balanceSlider);
-    balanceSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 56, 16);
-    balanceAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
-        processorRef.apvts, ParamID::balance, balanceSlider);
-
-    addAndMakeVisible (balanceLabel);
-    balanceLabel.setText ("Early <-> Late", juce::dontSendNotification);
-    balanceLabel.setJustificationType (juce::Justification::centred);
-    balanceLabel.setFont (juce::FontOptions (11.0f));
-
     addAndMakeVisible (dialsPanel);
 
-    // Height trimmed from 760 to 620: the visualizer/breakpoint-editor pane
-    // is scaled to 66% of what it was (412px -> ~272px) -- everything else
-    // (button row, dials area, margins) is unchanged, so shrinking the
-    // window by exactly the freed 140px keeps resized()'s existing "give
-    // the visualizer whatever's left over" logic correct with no other
-    // changes needed there.
-    setSize (1120, 620);
+    // Same overall size as before Balance moved down into ParamDialsPanel --
+    // removing its divider strip reservation in resized() (see paneWidth)
+    // hands that freed width straight to the two visualizer panes without
+    // needing the window itself to grow any further. The dials area below
+    // stays a FIXED 735 wide (see resized(), kDialsAreaWidth) rather than
+    // stretching to match, so the window's extra width still shows up as a
+    // black margin either side of it.
+    setSize (875, 619);
 }
 
 GrainReverb2AudioProcessorEditor::~GrainReverb2AudioProcessorEditor()
@@ -203,9 +204,9 @@ void GrainReverb2AudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colours::black);
 
-    // The "little border between the two" -- a thin vertical line down the
-    // middle of the divider strip. dividerLineBounds is set in resized(),
-    // so this can't drift out of sync with the actual layout.
+    // The only thing marking early/late's boundary now that Balance no
+    // longer lives here as its own strip -- dividerLineBounds is set in
+    // resized(), so this can't drift out of sync with the actual layout.
     g.setColour (juce::Colours::grey.withAlpha (0.4f));
     g.drawVerticalLine (dividerLineBounds.getCentreX(),
                          (float) dividerLineBounds.getY(), (float) dividerLineBounds.getBottom());
@@ -215,16 +216,30 @@ void GrainReverb2AudioProcessorEditor::resized()
 {
     auto bounds = getLocalBounds().reduced (10);
 
-    auto dialsArea = bounds.removeFromBottom (280); // taller grid now (more dials -- early's 6 + late's 9)
+    // Dials area -- 3 rows tall, both sides fully populated 3x3 grids.
+    // FIXED width (735 -- 3 columns of 105 either side of ParamDialsPanel's
+    // own 105-wide centre column) and horizontally CENTRED, rather than
+    // stretched to fill the window's full width: the visualizer panes
+    // below now deliberately get more width than this to feel less
+    // cramped, which leaves a black margin either side of the dial area
+    // as a visible, accepted trade-off.
+    constexpr int kDialsAreaWidth = 735;
+    auto dialsFullWidthRow = bounds.removeFromBottom (285);
     bounds.removeFromBottom (10); // gap
-    dialsPanel.setBounds (dialsArea);
+    dialsPanel.setBounds (dialsFullWidthRow.withSizeKeepingCentre (kDialsAreaWidth, dialsFullWidthRow.getHeight()));
 
-    // Divider (balance fader) width reserved from the CENTRE, splitting
-    // what's left evenly between the early (left) and late (right) panes.
-    constexpr int kDividerWidth = 70;
-    const int paneWidth = (bounds.getWidth() - kDividerWidth) / 2;
+    // No divider strip reserved anymore -- Balance (its one control) moved
+    // down into ParamDialsPanel's centre column as a regular knob, so the
+    // early/late visualizer panes now split the width between them,
+    // minus a tiny black gap (unpainted -- the window's own black
+    // fillAll() in paint() shows straight through) so the two panes don't
+    // sit flush against each other.
+    constexpr int kPaneGap = 6;
+    const int paneWidth = (bounds.getWidth() - kPaneGap) / 2;
     auto earlyPane = bounds.removeFromLeft (paneWidth);
-    auto dividerArea = bounds.removeFromLeft (kDividerWidth);
+    // dividerLineBounds is this gap itself -- its centre X is where the
+    // thin separator line in paint() gets drawn.
+    dividerLineBounds = bounds.removeFromLeft (kPaneGap);
     auto latePane = bounds; // remainder
 
     // ---- Early pane (left) ----
@@ -234,6 +249,10 @@ void GrainReverb2AudioProcessorEditor::resized()
     earlyQButton.setBounds (earlyButtonRow.removeFromLeft (earlyW).reduced (4, 2));
     earlyTailButton.setBounds (earlyButtonRow.reduced (4, 2));
     earlyPane.removeFromTop (10); // breathing room -- see the late pane's identical comment below
+    // Label now sits BETWEEN the visualizer and ParamDialsPanel's knobs
+    // below, not above the button row -- removed from the bottom of the
+    // pane before the visualizer claims whatever's left.
+    earlyReflectionsLabel.setBounds (earlyPane.removeFromBottom (24));
     earlyBufferVisualizer.setBounds (earlyPane);
     earlyBreakpointEditor.setBounds (earlyPane); // identical bounds -- lines the overlay up with the waveform
 
@@ -251,12 +270,7 @@ void GrainReverb2AudioProcessorEditor::resized()
     // plot-area math (clipping happens at a component's own bounds, not
     // here, so this gap alone wouldn't have fixed it).
     latePane.removeFromTop (10);
+    lateReflectionsLabel.setBounds (latePane.removeFromBottom (24));
     lateBufferVisualizer.setBounds (latePane);
     lateBreakpointEditor.setBounds (latePane);
-
-    // ---- Divider (balance fader), vertically centred in its strip ----
-    dividerArea.removeFromTop (28); // align with the button rows on both sides
-    dividerArea.removeFromTop (10);
-    balanceLabel.setBounds (dividerArea.removeFromTop (16));
-    balanceSlider.setBounds (dividerArea.reduced (14, 4));
 }

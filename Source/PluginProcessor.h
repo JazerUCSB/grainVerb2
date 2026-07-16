@@ -22,21 +22,44 @@ namespace ParamID
     static constexpr auto numGrainVoices = "numGrainVoices"; // 50-200, per-bank voice count
 
     // Early reflections -- a second, smaller/faster-scaled instance of the
-    // same GrainVoiceEngine. Shares late's cutoff/Q/tail curve UI pattern
-    // but with its own independent curves, and its own bufferLenMs/
-    // fadeSamps/meanWindowMs/windowRangeMs/feedback/jitter/dispersion.
+    // same GrainVoiceEngine, but prepared with singleBufferDualFeedback:
+    // one buffer (del1) instead of two, with Bank 1 (write-only) and Bank 2
+    // (the one we actually listen to) both feeding back into that SAME
+    // buffer via the SAME earlyFeedback value (see syncParams(), which
+    // mirrors it into both GrainReverbParams::fb and fb2) -- a single dial
+    // was indistinguishable from two by ear, so this replaced the earlier
+    // separate earlyFeedback/earlyFeedback2 pair. Shares late's cutoff/Q/
+    // tail curve UI pattern but with its own independent curves, and its
+    // own bufferLenMs/fadeSamps/meanWindowMs/windowRangeMs/jitter/
+    // dispersion.
     static constexpr auto earlyBufferLenMs   = "earlyBufferLenMs";
     static constexpr auto earlyFadeSamps     = "earlyFadeSamps";
     static constexpr auto earlyMeanWindowMs  = "earlyMeanWindowMs";
     static constexpr auto earlyWindowRangeMs = "earlyWindowRangeMs";
-    static constexpr auto earlyFeedback      = "earlyFeedback";
+    static constexpr auto earlyFeedback      = "earlyFeedback"; // drives both fb1 and fb2 equally
     static constexpr auto earlyJitter        = "earlyJitter";
     static constexpr auto earlyDispersion    = "earlyDispersion";
     static constexpr auto earlyNumGrainVoices = "earlyNumGrainVoices"; // 30-100, per-bank voice count
 
     // Crossfades the early/late wet signals BEFORE the shared dry/wet mix
-    // above is applied -- 0 = all late, 1 = all early.
+    // above is applied -- 0 = all early, 1 = all late.
     static constexpr auto balance            = "balance";
+
+    // Independent level trims, applied to each side's wet signal right
+    // where it's computed in processBlock() -- unity (0dB) sits at the
+    // dial's centre (12 o'clock), +-24dB either side. These sit ALONGSIDE
+    // balance (a crossfade), not instead of it: balance shifts the mix
+    // between the two, these correct for one side just reading quieter/
+    // louder than the other at matched settings.
+    static constexpr auto earlyGainDb        = "earlyGainDb";
+    static constexpr auto lateGainDb         = "lateGainDb";
+
+    // Shared -- the SAME value is written into both lateShared.params.
+    // predelayMs and earlyShared.params.predelayMs (see syncParams()),
+    // pushing back the nearest edge of every grain's readable range in
+    // BOTH engines by this many ms (see
+    // GrainVoiceEngine::clampReadAgainstWriteHead()).
+    static constexpr auto predelayMs         = "predelayMs";
 }
 
 // GrainReverb2AudioProcessor is the class every plugin format wrapper
@@ -136,10 +159,21 @@ private:
     std::atomic<float>* earlyNumGrainVoicesParam = nullptr;
     std::atomic<float>* balanceParam             = nullptr;
 
+    // Shared -- read once in syncParams() and written into BOTH engines'
+    // params.predelayMs (unlike everything else above, which is
+    // early-/late-specific).
+    std::atomic<float>* predelayMsParam          = nullptr;
+
     // Not routed through GrainReverbParams/syncParams -- mix is a pure
     // wet/dry blend applied in processBlock AFTER the engine runs, so the
     // engine itself never needs to know about it.
     std::atomic<float>* mixParam           = nullptr;
+
+    // Same story as mix -- pure output-stage trims, applied to each
+    // side's wet signal directly in processBlock(), never touching
+    // GrainReverbParams/syncParams.
+    std::atomic<float>* earlyGainDbParam   = nullptr;
+    std::atomic<float>* lateGainDbParam    = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrainReverb2AudioProcessor)
 };

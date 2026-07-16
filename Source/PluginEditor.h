@@ -10,10 +10,13 @@
 // processor so it can read/write parameters -- it never owns DSP state.
 //
 // Layout: early reflections on the LEFT, late reflections (the original
-// del1/del2 engine) on the RIGHT, with a thin divider and a vertical
-// balance fader in between. Both sides use the exact same
-// CircularBufferVisualizer/BreakpointEditor classes, just constructed
-// against different engine/state references -- see those classes' headers.
+// del1/del2 engine) on the RIGHT, with just a thin dividing line between
+// them -- Balance used to live here as a dedicated vertical fader, but is
+// now just another knob down in ParamDialsPanel's centre column, so both
+// visualizer panes get the full width to themselves instead. Both sides
+// use the exact same CircularBufferVisualizer/BreakpointEditor classes,
+// just constructed against different engine/state references -- see those
+// classes' headers.
 class GrainReverb2AudioProcessorEditor : public juce::AudioProcessorEditor
 {
 public:
@@ -25,6 +28,13 @@ public:
 
 private:
     GrainReverb2AudioProcessor& processorRef;
+
+    // Section headers -- one strip reserved between each pane's own
+    // visualizer and ParamDialsPanel's knobs below it (see resized()), so
+    // it's unambiguous which side is which even before reading any
+    // individual dial.
+    juce::Label earlyReflectionsLabel;
+    juce::Label lateReflectionsLabel;
 
     juce::TextButton earlyCutoffButton { "Cutoff" }, earlyQButton { "Q" }, earlyTailButton { "Tail" };
     juce::TextButton lateCutoffButton { "Cutoff" }, lateQButton { "Q" }, lateTailButton { "Tail" };
@@ -53,19 +63,13 @@ private:
     CircularBufferVisualizer lateBufferVisualizer;
     BreakpointEditor lateBreakpointEditor;
 
-    // Crossfades the early/late wet signals -- a dedicated vertical fader
-    // sitting in the divider between the two panes (not just another dial
-    // in the grid below), bound directly to the "balance" APVTS parameter.
-    juce::Slider balanceSlider { juce::Slider::LinearVertical, juce::Slider::TextBoxBelow };
-    juce::Label balanceLabel;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> balanceAttachment;
-
     ParamDialsPanel dialsPanel;
 
-    // The divider strip's full vertical span (set in resized(), used in
-    // paint() to draw the border line) -- stored rather than recomputed
-    // with magic numbers in paint(), so it can never drift out of sync
-    // with the actual layout.
+    // A single thin line marking the boundary between the early (left) and
+    // late (right) visualizer panes -- set in resized(), read back in
+    // paint() so it can never drift out of sync with the actual layout.
+    // All that's left of the old divider strip now that Balance (its one
+    // control) moved down into ParamDialsPanel's centre column.
     juce::Rectangle<int> dividerLineBounds;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrainReverb2AudioProcessorEditor)

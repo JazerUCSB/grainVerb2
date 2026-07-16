@@ -52,6 +52,7 @@ juce::Rectangle<float> BreakpointEditor::getPlotArea() const
     bounds.removeFromBottom (kVisualizerRulerHeight);
     bounds.removeFromLeft (kVisualizerLeftMargin);
     bounds.removeFromTop (kVisualizerTopMargin); // headroom so a max-value point isn't top-clipped
+    bounds.removeFromRight (kVisualizerRightMargin); // ditto for a point at dn = 1 (far right)
     return bounds.toFloat();
 }
 

@@ -37,13 +37,25 @@ namespace
             [] (float v, int) { return juce::String ((juce::int64) std::round (v)) + " grains"; });
     }
 
+    // Explicit "+" for positive values (0 itself gets none) -- these are
+    // bipolar trims centred on unity, so "3.00 dB" alone reads ambiguously
+    // next to "-3.00 dB" without it.
+    juce::AudioParameterFloatAttributes dbUnitAttrs()
+    {
+        return juce::AudioParameterFloatAttributes().withStringFromValueFunction (
+            [] (float v, int) { return (v > 0.0f ? juce::String ("+") : juce::String()) + juce::String (v, 2) + " dB"; });
+    }
+
     // MAXIMUM capacity for each engine's del1 -- earlyBufferLenMs/
     // bufferLenMs dials pick the ACTIVE portion within this (see
     // GrainVoiceEngine::seedGrains()'s del1Len formula), never resized
-    // after prepare(). del2 has no dial at all for either engine -- always
-    // fully active at its own fixed capacity.
-    constexpr double kEarlyDel1MaxSeconds = 1.0; // 1000ms
-    constexpr double kEarlyDel2MaxSeconds = 0.6; // 600ms
+    // after prepare(). Late still has a fixed-capacity del2 with no dial
+    // of its own; early has no del2 at all any more (singleBufferDualFeedback
+    // -- see GrainVoiceEngine::prepare()), so there's no equivalent early
+    // constant here. Shrunk from 1.0s to match earlyBufferLenMs's dial
+    // range dropping to 25-400ms -- no point allocating capacity the dial
+    // can never reach.
+    constexpr double kEarlyDel1MaxSeconds = 0.4; // 400ms
 
     // MAXIMUM voices allocated per bank -- matches each engine's own
     // numGrainVoices dial range's upper bound (see createParameterLayout()).
@@ -82,6 +94,9 @@ GrainReverb2AudioProcessor::GrainReverb2AudioProcessor()
     earlyDispersionParam     = apvts.getRawParameterValue (ParamID::earlyDispersion);
     earlyNumGrainVoicesParam = apvts.getRawParameterValue (ParamID::earlyNumGrainVoices);
     balanceParam             = apvts.getRawParameterValue (ParamID::balance);
+    earlyGainDbParam         = apvts.getRawParameterValue (ParamID::earlyGainDb);
+    lateGainDbParam          = apvts.getRawParameterValue (ParamID::lateGainDb);
+    predelayMsParam          = apvts.getRawParameterValue (ParamID::predelayMs);
 
     // No allocation here otherwise -- sample rate isn't known yet. Real
     // DSP setup happens in prepareToPlay().
@@ -108,14 +123,39 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     // capacity is active (see kEarlyDel1MaxSeconds's comment above). del2
     // still has no dial for either engine -- always fully active at its
     // own fixed capacity.
-    addParam (ParamID::bufferLenMs,      "Late ",  "Buffer Length (ms)",       Range { 200.0f, 6000.0f }, 3500.0f, msUnitAttrs());
-    addParam (ParamID::earlyBufferLenMs, "Early ", "Buffer Length (ms)",       Range { 50.0f, 1000.0f },  200.0f,  msUnitAttrs());
+    // Renamed from "Buffer Length" to "Read Range" (display text only --
+    // ParamID::bufferLenMs/earlyBufferLenMs themselves are unchanged, so
+    // existing saved state/automation still resolves correctly): a grain
+    // reading position is a fixed delay TAP somewhere within this many ms
+    // behind the write head, not a container a grain has to "fit inside"
+    // -- a grain (Grain Size) can be, and often should be, longer than
+    // this range without anything breaking (see GrainVoiceEngine's
+    // read-anchor invariant). "Buffer Length" implied the latter and was
+    // genuinely confusing once Grain Size could exceed it.
+    addParam (ParamID::bufferLenMs,      "Late ",  "Read Range (ms)",       Range { 200.0f, 6000.0f }, 3500.0f, msUnitAttrs());
+    // Range dropped to 25-400ms (was 50-1000ms) -- see kEarlyDel1MaxSeconds
+    // below, shrunk to match. Default stays 50ms + Grain Size default
+    // 200ms below: grain size 4x the buffer range collapses each grain
+    // into a static short-delay tap (see GrainVoiceEngine's read-anchor
+    // invariant: at rate=1, read stays a FIXED distance behind the write
+    // head for the grain's whole life), landing much closer to a classic
+    // multi-tap early-reflections generator than a churning granular
+    // cloud -- this was found by ear to be the best match against a
+    // reference ER plugin.
+    addParam (ParamID::earlyBufferLenMs, "Early ", "Read Range (ms)",       Range { 25.0f, 400.0f },  50.0f,   msUnitAttrs());
     addParam (ParamID::feedback,         "Late ",  "Feedback",                 Range { 0.0f, 0.999f },    0.5f,    plain3DecimalAttrs());
-    addParam (ParamID::earlyFeedback,    "Early ", "Feedback",                 Range { 0.0f, 0.999f },    0.5f,    plain3DecimalAttrs());
+    // Early used to split this into two dials (Feedback 1/2 -- write-only
+    // bank vs. listen bank, singleBufferDualFeedback's two loops into the
+    // shared buffer, see GrainVoiceEngine::prepare()), but they were
+    // audibly indistinguishable from one another -- one dial now drives
+    // both (see syncParams(), which mirrors this into GrainReverbParams::
+    // fb AND fb2). Lower default (0.1 vs. late's 0.5) since early's shared-
+    // buffer topology builds up energy faster per unit of feedback.
+    addParam (ParamID::earlyFeedback,    "Early ", "Feedback",                 Range { 0.0f, 0.999f },    0.1f,    plain3DecimalAttrs());
     addParam (ParamID::numGrainVoices,      "Late ",  "Number of Grains",      Range { 50.0f, 200.0f },   100.0f,  grainsUnitAttrs());
     addParam (ParamID::earlyNumGrainVoices, "Early ", "Number of Grains",      Range { 30.0f, 100.0f },   50.0f,   grainsUnitAttrs());
     addParam (ParamID::meanWindowMs,      "Late ",  "Grain Size (ms)",         Range { 50.0f, 2000.0f },  200.0f,  msUnitAttrs());
-    addParam (ParamID::earlyMeanWindowMs, "Early ", "Grain Size (ms)",         Range { 50.0f, 500.0f },   100.0f,  msUnitAttrs());
+    addParam (ParamID::earlyMeanWindowMs, "Early ", "Grain Size (ms)",         Range { 50.0f, 500.0f },   200.0f,  msUnitAttrs());
     addParam (ParamID::windowRangeMs,      "Late ",  "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  50.0f,   msUnitAttrs());
     addParam (ParamID::earlyWindowRangeMs, "Early ", "Grain Size Variance (ms)", Range { 0.0f, 500.0f },  25.0f,   msUnitAttrs());
     addParam (ParamID::fadeSamps,      "Late ",  "Fade (samples)",             Range { 5.0f, 1000.0f },   200.0f,  sampsUnitAttrs());
@@ -124,17 +164,39 @@ juce::AudioProcessorValueTreeState::ParameterLayout GrainReverb2AudioProcessor::
     addParam (ParamID::earlyJitter, "Early ", "Rate Jitter", Range { 0.0f, 0.1f }, 0.0f, plain3DecimalAttrs());
     addParam (ParamID::dispersion,      "Late ",  "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
     addParam (ParamID::earlyDispersion, "Early ", "Stereo Dispersion", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs());
-    addParam (ParamID::mix, "Late ", "Mix", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()); // no early equivalent -- shared via Balance instead
+    // Renamed from "Late Mix" -- it's a post-balance blend of BOTH
+    // engines' combined output (applied in processBlock() after early/late
+    // are already crossfaded together), not a late-only control; the old
+    // "Late " prefix was a leftover from when it lived in late's
+    // ParamDialsPanel grid, which it no longer does (see PluginEditor's
+    // shared middle strip). ParamID::mix itself is unchanged, so saved
+    // state/automation still resolves correctly.
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::mix, 1 }, "Mix", Range { 0.0f, 1.0f }, 1.0f, plain3DecimalAttrs()));
 
     params.push_back (std::make_unique<Param> (
         juce::ParameterID { ParamID::balance, 1 }, "Early/Late Balance",
         Range { 0.0f, 1.0f }, 0.5f, plain3DecimalAttrs()));
+
+    // Independent output trims, alongside (not instead of) Balance --
+    // unity (0dB) sits exactly at the dial's centre/12-o'clock since the
+    // range is symmetric and 0 is the default.
+    addParam (ParamID::earlyGainDb, "Early ", "Gain", Range { -24.0f, 24.0f }, 0.0f, dbUnitAttrs());
+    addParam (ParamID::lateGainDb,  "Late ",  "Gain", Range { -24.0f, 24.0f }, 0.0f, dbUnitAttrs());
+
+    // Shared -- one control, written into BOTH engines' params.predelayMs
+    // in syncParams(). No prefix (it's neither early- nor late-specific).
+    params.push_back (std::make_unique<Param> (
+        juce::ParameterID { ParamID::predelayMs, 1 }, "Predelay", Range { 0.0f, 100.0f }, 0.0f, msUnitAttrs()));
 
     return { params.begin(), params.end() };
 }
 
 void GrainReverb2AudioProcessor::syncParams()
 {
+    // Shared -- same value goes into both engines' params below.
+    const double predelayMs = (double) predelayMsParam->load();
+
     auto& p = lateShared.params;
     p.fadeSamps     = (double) fadeSampsParam->load();
     p.meanWindowMs  = (double) meanWindowMsParam->load();
@@ -152,6 +214,7 @@ void GrainReverb2AudioProcessor::syncParams()
     // dials were redundant, so bufferLenMs alone now controls del1's
     // active/scatter range.
     p.readScatter   = 1.0;
+    p.predelayMs    = predelayMs;
 
     auto& ep = earlyShared.params;
     ep.bufferLenMs   = (double) earlyBufferLenMsParam->load();
@@ -159,10 +222,12 @@ void GrainReverb2AudioProcessor::syncParams()
     ep.meanWindowMs  = (double) earlyMeanWindowMsParam->load();
     ep.windowRangeMs = (double) earlyWindowRangeMsParam->load();
     ep.fb            = (double) earlyFeedbackParam->load();
+    ep.fb2           = ep.fb; // one dial now drives both feedback loops equally
     ep.jitter        = (double) earlyJitterParam->load();
     ep.dispersion    = (double) earlyDispersionParam->load();
     ep.numGrainVoices = (double) earlyNumGrainVoicesParam->load();
     ep.readScatter   = 1.0;
+    ep.predelayMs    = predelayMs;
 }
 
 GrainReverb2AudioProcessor::~GrainReverb2AudioProcessor() {}
@@ -176,7 +241,7 @@ void GrainReverb2AudioProcessor::prepareToPlay (double sampleRate, int /*samples
 
     earlyShared.prepare (sampleRate);
     earlyEngine.prepare (sampleRate, earlyShared, kEarlyMaxVoicesPerBank, kEarlyMaxVoicesPerBank,
-                          kEarlyDel1MaxSeconds, kEarlyDel2MaxSeconds);
+                          kEarlyDel1MaxSeconds, 0.0, /*singleBufferDualFeedback*/ true);
 }
 
 void GrainReverb2AudioProcessor::releaseResources() {}
@@ -201,6 +266,13 @@ void GrainReverb2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const double mix = (double) mixParam->load();
     const double balance = (double) balanceParam->load();
 
+    // Independent trims on top of balance -- read once per block, same as
+    // mix/balance above (no additional smoothing beyond what those two
+    // already get away without): a plain dB-to-linear conversion applied
+    // to each side's wet signal.
+    const double earlyGainLin = std::pow (10.0, (double) earlyGainDbParam->load() / 20.0);
+    const double lateGainLin  = std::pow (10.0, (double) lateGainDbParam->load() / 20.0);
+
     for (int i = 0; i < numSamples; ++i)
     {
         const double dryL = (double) left[i];
@@ -213,11 +285,41 @@ void GrainReverb2AudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         double lateWetL = 0.0, lateWetR = 0.0;
         lateEngine.processSample (dryL, dryR, lateShared, lateWetL, lateWetR);
 
-        double earlyWetL = 0.0, earlyWetR = 0.0;
-        earlyEngine.processSample (dryL, dryR, earlyShared, earlyWetL, earlyWetR);
+        // Late's audible bank (Bank 2, reading del2) never receives the
+        // dry input directly -- only fb*(aud1+aud2), feedback that's
+        // already been through Bank 1's own normalization once. Early's
+        // audible bank shares del1 with the write bank, so it reads the
+        // raw dry input at full strength in the very buffer it's reading
+        // -- one fewer feedback/normalization stage between input and
+        // output. That structural gap, not anything wrong with either
+        // engine's settings, is why late reads quieter than early at
+        // matched feedback values. Boost late's wet signal here (not
+        // inside GrainVoiceEngine, which both engines share) to close it.
+        constexpr double kLateOutputBoost = 2.0;
+        lateWetL *= kLateOutputBoost;
+        lateWetR *= kLateOutputBoost;
+        lateWetL *= lateGainLin;
+        lateWetR *= lateGainLin;
 
-        const double wetL = lateWetL * (1.0 - balance) + earlyWetL * balance;
-        const double wetR = lateWetR * (1.0 - balance) + earlyWetR * balance;
+        // Early's audible bank shares del1 with the write bank, so it
+        // reads the raw dry input directly into the very buffer it's
+        // reading -- the exact structural gap that makes hot input drive
+        // coherent-overshoot-based distortion in GrainVoiceEngine's tanh
+        // safety net (see its comment). Scaling the input down before it
+        // ever reaches early's engine reduces how much energy builds up
+        // in that shared buffer/feedback loop in the first place --
+        // fixing the overshoot at its source instead of trying to patch
+        // it after the fact downstream.
+        constexpr double kEarlyInputScale = 0.25;
+        double earlyWetL = 0.0, earlyWetR = 0.0;
+        earlyEngine.processSample (dryL * kEarlyInputScale, dryR * kEarlyInputScale, earlyShared, earlyWetL, earlyWetR);
+        earlyWetL *= earlyGainLin;
+        earlyWetR *= earlyGainLin;
+
+        // 0 = all early, 1 = all late (matches the Balance dial's "Early"/
+        // "Late" low/high labels in ParamDialsPanel).
+        const double wetL = earlyWetL * (1.0 - balance) + lateWetL * balance;
+        const double wetR = earlyWetR * (1.0 - balance) + lateWetR * balance;
 
         left[i]  = (float) (dryL * (1.0 - mix) + wetL * mix);
         right[i] = (float) (dryR * (1.0 - mix) + wetR * mix);

@@ -1,58 +1,117 @@
 #include "ParamDialsPanel.h"
 #include "PaneTheme.h"
 
+namespace
+{
+    // Centre column width -- matches PluginEditor's own kDividerWidth so
+    // the divider strip above lines up with this column below, AND matches
+    // one early/late column's own width (see resized()), so Predelay/Mix
+    // render at the same size as every other dial. Scaled to 75% of an
+    // earlier, bigger pass at this (140 -> 105) alongside the same 75%
+    // shrink applied to PluginEditor's dialsArea height -- both dimensions
+    // shrink together so the whole dial (box + knob) scales down uniformly.
+    constexpr int kCenterColumnWidth = 105;
+}
+
 ParamDialsPanel::ParamDialsPanel (GrainReverb2AudioProcessor& processorToUse)
     : processor (processorToUse)
 {
-    // Early (left, 8 dials -- row 3 only has 2, the 3rd cell is left
-    // empty): value-readout formatting (units, decimal places) lives on
-    // the parameter itself (see PluginProcessor.cpp's
-    // createParameterLayout()), not here.
-    addDial (earlyDials, ParamID::earlyBufferLenMs,      "Buffer Length",    true);
-    addDial (earlyDials, ParamID::earlyFeedback,         "Feedback",         true);
-    addDial (earlyDials, ParamID::earlyNumGrainVoices,   "Num Grains",       true);
-    addDial (earlyDials, ParamID::earlyMeanWindowMs,     "Grain Size",       true);
-    addDial (earlyDials, ParamID::earlyWindowRangeMs,    "Grain Variance",   true);
-    addDial (earlyDials, ParamID::earlyFadeSamps,        "Grain Fade",       true);
-    addDial (earlyDials, ParamID::earlyJitter,           "Jitter",           true);
-    addDial (earlyDials, ParamID::earlyDispersion,       "Dispersion",       true);
+    // Early (left, 9 dials, fully populated 3x3 -- Early Gain moved in
+    // from the old centre column, completing the grid): value-readout
+    // formatting (units, decimal places) lives on the parameter itself
+    // (see PluginProcessor.cpp's createParameterLayout()), not here.
+    addDial (earlyDials, ParamID::earlyBufferLenMs,      "Read Range",    kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyFeedback,         "Feedback",        kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyNumGrainVoices,   "Num Grains",      kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyMeanWindowMs,     "Grain Size",      kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyWindowRangeMs,    "Grain Variance",  kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyFadeSamps,        "Grain Fade",      kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyJitter,           "Jitter",          kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyDispersion,       "Dispersion",      kEarlyBorderColour);
+    addDial (earlyDials, ParamID::earlyGainDb,           "Early Gain",      kEarlyBorderColour);
 
-    // Late (right, 9 dials -- fully populated 3x3 grid).
-    addDial (lateDials, ParamID::bufferLenMs,      "Buffer Length",   false);
-    addDial (lateDials, ParamID::feedback,         "Feedback",        false);
-    addDial (lateDials, ParamID::numGrainVoices,   "Num Grains",      false);
-    addDial (lateDials, ParamID::meanWindowMs,     "Grain Size",      false);
-    addDial (lateDials, ParamID::windowRangeMs,    "Grain Variance",  false);
-    addDial (lateDials, ParamID::fadeSamps,        "Grain Fade",      false);
-    addDial (lateDials, ParamID::jitter,           "Jitter",          false);
-    addDial (lateDials, ParamID::dispersion,       "Dispersion",      false);
-    addDial (lateDials, ParamID::mix,              "Mix",             false);
+    // Late (right, 9 dials, fully populated 3x3 -- Late Gain moved in from
+    // the old centre column, completing the grid the same way early's did).
+    addDial (lateDials, ParamID::bufferLenMs,      "Read Range",   kLateBorderColour);
+    addDial (lateDials, ParamID::feedback,         "Feedback",       kLateBorderColour);
+    addDial (lateDials, ParamID::numGrainVoices,   "Num Grains",     kLateBorderColour);
+    addDial (lateDials, ParamID::meanWindowMs,     "Grain Size",     kLateBorderColour);
+    addDial (lateDials, ParamID::windowRangeMs,    "Grain Variance", kLateBorderColour);
+    addDial (lateDials, ParamID::fadeSamps,        "Grain Fade",     kLateBorderColour);
+    addDial (lateDials, ParamID::jitter,           "Jitter",         kLateBorderColour);
+    addDial (lateDials, ParamID::dispersion,       "Dispersion",     kLateBorderColour);
+    addDial (lateDials, ParamID::lateGainDb,       "Late Gain",      kLateBorderColour);
+
+    // Centre column (1 x 3, top to bottom): Predelay, Balance, Mix -- all
+    // genuinely shared (neutral border colour), affecting both engines'
+    // combined output. Balance used to be a dedicated vertical fader in
+    // the divider strip above; it's now just another knob here, with
+    // "Early"/"Late" overriding its raw 0/1 low/high labels -- matches
+    // PluginProcessor::processBlock()'s wetL/wetR crossfade exactly
+    // (0 = all early, 1 = all late).
+    addDial (centerDials, ParamID::predelayMs, "Predelay", kSharedBorderColour);
+    addDial (centerDials, ParamID::balance,    "Balance",  kSharedBorderColour, "Early", "Late");
+    addDial (centerDials, ParamID::mix,        "Mix",      kSharedBorderColour);
+}
+
+ParamDialsPanel::~ParamDialsPanel()
+{
+    // Every dial's slider was given &radialKnobLookAndFeel in addDial();
+    // all must be cleared before radialKnobLookAndFeel is destroyed, or
+    // the Slider would hold a dangling raw pointer past its lifetime.
+    auto clearLookAndFeel = [] (juce::OwnedArray<Dial>& group)
+    {
+        for (auto* d : group)
+            d->slider.setLookAndFeel (nullptr);
+    };
+    clearLookAndFeel (earlyDials);
+    clearLookAndFeel (lateDials);
+    clearLookAndFeel (centerDials);
 }
 
 ParamDialsPanel::Dial& ParamDialsPanel::addDial (juce::OwnedArray<Dial>& group, const juce::String& paramID,
-                                                  const juce::String& labelText, bool isEarly)
+                                                  const juce::String& labelText, juce::Colour borderColour,
+                                                  const juce::String& lowLabelOverride, const juce::String& highLabelOverride)
 {
     auto* d = group.add (new Dial());
+    d->borderColour = borderColour;
+
+    // Read by RadialKnobLookAndFeel::drawRotarySlider() to override the
+    // low/high endpoint labels it would otherwise compute from the
+    // slider's own min/max -- only set when the caller actually wants
+    // custom text (e.g. Balance's "Late"/"Early"), so every other dial's
+    // properties stay empty and the LookAndFeel falls back to numeric labels.
+    if (lowLabelOverride.isNotEmpty())
+        d->slider.getProperties().set ("lowLabel", lowLabelOverride);
+    if (highLabelOverride.isNotEmpty())
+        d->slider.getProperties().set ("highLabel", highLabelOverride);
 
     d->slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    // Wide enough to fit a unit suffix like "200.000 ms" without truncating.
-    d->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
+    // Wide enough to fit a unit suffix like "200.000 ms" without truncating;
+    // sized up alongside the dial's own ~5x growth so the readout doesn't
+    // look tiny under the now much bigger knob.
+    d->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 110, 26);
 
     // The default LookAndFeel_V4 text box renders as a flat white-ish
-    // panel regardless of what sits behind it -- clashing with the
-    // per-dial chip drawn in paint() below. Make the box itself
-    // transparent so the chip shows straight through, and tint the
-    // readout text/caret to read clearly against that chip colour instead.
+    // panel regardless of what sits behind it -- clashing with the pane
+    // background showing through behind this dial. Make the box itself
+    // transparent so the pane colour shows straight through, and tint the
+    // readout text/caret to read clearly against that background instead.
     d->slider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
     d->slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     d->slider.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white);
+    // rotarySliderFillColourId is what RadialKnobLookAndFeel uses for the
+    // knob's radial pointer line (and a faint fill behind it) -- matched
+    // to the LookAndFeel's own default thumb colour rather than guessing a
+    // hex value, so it reads as the same accent colour throughout.
     d->slider.setColour (juce::Slider::rotarySliderFillColourId,
-                          isEarly ? kEarlyLightColour : kLateLightColour);
+                          d->slider.findColour (juce::Slider::thumbColourId));
+    d->slider.setLookAndFeel (&radialKnobLookAndFeel);
     addAndMakeVisible (d->slider);
 
     d->label.setText (labelText, juce::dontSendNotification);
     d->label.setJustificationType (juce::Justification::centred);
-    d->label.setFont (juce::FontOptions (12.0f));
+    d->label.setFont (juce::FontOptions (13.0f)); // 2pt down from an earlier pass
     d->label.setColour (juce::Label::textColourId, juce::Colours::white);
     addAndMakeVisible (d->label);
 
@@ -89,7 +148,7 @@ void ParamDialsPanel::layoutGroup (juce::OwnedArray<Dial>& group, juce::Rectangl
                             .reduced (4, 2);
 
         auto cell = d->cellBounds.reduced (6, 4);
-        auto labelArea = cell.removeFromTop (16);
+        auto labelArea = cell.removeFromTop (20);
         d->label.setBounds (labelArea);
         d->slider.setBounds (cell);
     }
@@ -98,35 +157,46 @@ void ParamDialsPanel::layoutGroup (juce::OwnedArray<Dial>& group, juce::Rectangl
 void ParamDialsPanel::resized()
 {
     auto bounds = getLocalBounds();
-    const auto earlyArea = bounds.removeFromLeft (bounds.getWidth() / 2);
-    const auto lateArea = bounds;
+    const int halfWidth = (bounds.getWidth() - kCenterColumnWidth) / 2;
+    const auto earlyArea = bounds.removeFromLeft (halfWidth);
+    const auto centerArea = bounds.removeFromLeft (kCenterColumnWidth);
+    const auto lateArea = bounds; // remainder
 
     layoutGroup (earlyDials, earlyArea, groupColumns);
     layoutGroup (lateDials, lateArea, groupColumns);
+    layoutGroup (centerDials, centerArea, 1); // single column -- Predelay, Balance, Mix top to bottom -- 3 rows, same as early/late
 }
 
 void ParamDialsPanel::paint (juce::Graphics& g)
 {
     auto bounds = getLocalBounds();
-    auto earlyArea = bounds.removeFromLeft (bounds.getWidth() / 2);
-    auto lateArea = bounds;
+    const int halfWidth = (bounds.getWidth() - kCenterColumnWidth) / 2;
+    auto earlyArea = bounds.removeFromLeft (halfWidth);
+    auto centerArea = bounds.removeFromLeft (kCenterColumnWidth);
+    auto lateArea = bounds; // remainder
 
     g.setColour (kEarlyPaneColour);
     g.fillRect (earlyArea);
+    g.setColour (kSharedPaneColour);
+    g.fillRect (centerArea);
     g.setColour (kLatePaneColour);
     g.fillRect (lateArea);
 
-    // A lighter-tinted rounded chip behind each dial's title+readout, so
-    // every control reads as its own labeled unit against the darker pane
-    // fill above, and so the slider's own (now-transparent) text box has
-    // something other than the raw pane colour behind it.
-    auto drawChips = [&] (juce::OwnedArray<Dial>& group, juce::Colour chipColour)
+    // Each dial sits directly on its pane's own plain background (filled
+    // above) -- no extra fill layer on top anymore. Instead, a rounded
+    // OUTLINE groups each dial's title+knob+readout together as one unit.
+    // Colour is stored PER DIAL (not per group) since centerDials mixes
+    // early-/late-/shared-tinted borders within one array.
+    auto drawBorders = [&] (juce::OwnedArray<Dial>& group)
     {
-        g.setColour (chipColour);
         for (auto* d : group)
-            g.fillRoundedRectangle (d->cellBounds.toFloat(), 6.0f);
+        {
+            g.setColour (d->borderColour);
+            g.drawRoundedRectangle (d->cellBounds.toFloat(), 6.0f, 2.0f);
+        }
     };
 
-    drawChips (earlyDials, kEarlyLightColour);
-    drawChips (lateDials, kLateLightColour);
+    drawBorders (earlyDials);
+    drawBorders (lateDials);
+    drawBorders (centerDials);
 }

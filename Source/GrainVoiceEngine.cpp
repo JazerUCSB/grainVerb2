@@ -31,13 +31,15 @@ double GrainVoiceEngine::wrapValue (double v, double lo, double hi)
 }
 
 // gen~'s peek(buf, pos, interp="linear"): fractional read between the
-// floor and ceil sample, wrapping at the buffer's end.
-double GrainVoiceEngine::peekLinear (const std::vector<double>& buf, double pos)
+// floor and ceil sample, wrapping at the ACTIVE region's end (activeLen),
+// NOT buf.size() -- see the header comment for why those two differ
+// whenever Read Range is below its maximum, and what went wrong when
+// this wrapped against buf.size() instead.
+double GrainVoiceEngine::peekLinear (const std::vector<double>& buf, double pos, double activeLen)
 {
-    const auto n = (double) buf.size();
-    pos = wrapValue (pos, 0.0, n);
+    pos = wrapValue (pos, 0.0, activeLen);
     const auto i0 = (size_t) pos;
-    const size_t i1 = (i0 + 1 == buf.size()) ? 0 : i0 + 1;
+    const size_t i1 = (i0 + 1 >= (size_t) activeLen) ? 0 : i0 + 1;
     const double frac = pos - (double) i0;
     return buf[i0] + frac * (buf[i1] - buf[i0]);
 }
@@ -58,7 +60,7 @@ int GrainVoiceEngine::chooseWriteChannel (int readChannel, double dispersion)
     return flip ? (1 - readChannel) : readChannel;
 }
 
-double GrainVoiceEngine::clampReadAgainstWriteHead (double rawRead, double dur, double rate, double spanLen)
+double GrainVoiceEngine::clampReadAgainstWriteHead (double rawRead, double dur, double rate, double spanLen, double predelaySamples)
 {
     const double wantedMargin = dur * std::abs (rate - 1.0);
     // Cap the margin at just under half of spanLen so [margin, spanLen-margin]
@@ -67,21 +69,49 @@ double GrainVoiceEngine::clampReadAgainstWriteHead (double rawRead, double dur, 
     // buffer has. In that extreme case every grain collapses toward the
     // buffer's centre (less diversity) rather than risking a collision.
     const double margin = juce::jlimit (0.0, juce::jmax (0.0, spanLen * 0.5 - 1.0), wantedMargin);
-    return juce::jlimit (margin, juce::jmax (margin, spanLen - margin), rawRead);
+
+    // predelaySamples pushes the lower bound up further still, capped so
+    // it can never exceed what spanLen minus the margin can accommodate
+    // (an oversized predelay just collapses toward the far/oldest end,
+    // same spirit as the margin cap above -- see the header comment).
+    const double safePredelay = juce::jmax (0.0, juce::jmin (predelaySamples, spanLen - margin - 1.0));
+    const double lowerBound = juce::jmax (margin, safePredelay);
+
+    return juce::jlimit (lowerBound, juce::jmax (lowerBound, spanLen - margin), rawRead);
+}
+
+double GrainVoiceEngine::minSpawnRead (double span)
+{
+    // 5% of the span, or 5 samples, whichever is larger -- see the header
+    // comment for why a flat 5-sample floor stopped being meaningful once
+    // early's buffer could be as short as ~2205 samples.
+    return juce::jmax (span * 0.05, 5.0);
 }
 
 void GrainVoiceEngine::prepare (double newSampleRate, const GrainReverbSharedState& shared,
                                  int numVoices1, int numVoices2,
-                                 double del1MaxSecondsToUse, double del2MaxSecondsToUse)
+                                 double del1MaxSecondsToUse, double del2MaxSecondsToUse,
+                                 bool singleBufferDualFeedbackToUse)
 {
     sampleRate = newSampleRate;
     del1MaxSeconds = del1MaxSecondsToUse;
+    singleBufferDualFeedback = singleBufferDualFeedbackToUse;
     hpCoeffG = std::exp (-2.0 * juce::MathConstants<double>::pi * 300.0 / sampleRate);
 
     del1L.assign ((size_t) (del1MaxSeconds * sampleRate), 0.0);
     del1R.assign ((size_t) (del1MaxSeconds * sampleRate), 0.0);
-    del2L.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
-    del2R.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
+    if (singleBufferDualFeedback)
+    {
+        // No second buffer -- Bank 2 shares del1L/del1R (see seedGrains()/
+        // processSample()).
+        del2L.clear();
+        del2R.clear();
+    }
+    else
+    {
+        del2L.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
+        del2R.assign ((size_t) (del2MaxSecondsToUse * sampleRate), 0.0);
+    }
 
     grains1.assign ((size_t) numVoices1, Grain {});
     grains2.assign ((size_t) numVoices2, Grain {});
@@ -94,6 +124,15 @@ void GrainVoiceEngine::prepare (double newSampleRate, const GrainReverbSharedSta
     prevMeanWindowSamps = mstosamps (shared.params.meanWindowMs);
     prevWindowRangeSamps = mstosamps (shared.params.windowRangeMs);
 
+    // See the class comment on del1LenState -- ~30ms glide time is fast
+    // enough that turning the Read Range dial still feels responsive,
+    // but slow enough that any single sample's change in the wrap modulus
+    // is inaudibly small. Initialized to the CURRENT bufferLenMs's target
+    // (not 0) so there's no glide-up from zero the moment playback starts.
+    constexpr double kDel1LenSmoothSeconds = 0.03;
+    del1LenSmoothCoeff = 1.0 - std::exp (-1.0 / (kDel1LenSmoothSeconds * sampleRate));
+    del1LenState = std::floor ((shared.params.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
+
     seedGrains (shared);
 }
 
@@ -103,15 +142,19 @@ void GrainVoiceEngine::seedGrains (const GrainReverbSharedState& shared)
     const auto* coeffs = shared.getLiveCoeffs();
 
     const double del1Len = std::floor ((p.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
-    const double del2Len = (double) del2L.size();
+    // In singleBufferDualFeedback mode there's no separate del2 -- Bank 2
+    // scatters across the SAME active range as Bank 1 (see the class
+    // comment in GrainVoiceEngine.h).
+    const double del2Len = singleBufferDualFeedback ? del1Len : (double) del2L.size();
     const double readSpan = p.readScatter * del1Len;
+    const double predelaySamples = mstosamps (p.predelayMs);
 
     for (auto& g : grains1)
     {
         g.rate = 1.0 + noise() * p.jitter;
         g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
-        const double rawRead1 = juce::jmax (5.0, std::abs (noise() * readSpan));
-        g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len);
+        const double rawRead1 = juce::jmax (minSpawnRead (readSpan), std::abs (noise() * readSpan));
+        g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len, predelaySamples);
         g.age  = std::abs (noise() * del1Len);
         g.sign = noise() >= 0.0 ? 1.0 : -1.0;
         g.readChannel = (noise() >= 0.0) ? 0 : 1;
@@ -130,8 +173,8 @@ void GrainVoiceEngine::seedGrains (const GrainReverbSharedState& shared)
     {
         g.rate = 1.0 + noise() * p.jitter;
         g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
-        const double rawRead2 = juce::jmax (5.0, std::abs (noise() * del2Len));
-        g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len);
+        const double rawRead2 = juce::jmax (minSpawnRead (del2Len), std::abs (noise() * del2Len));
+        g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len, predelaySamples);
         g.age  = std::abs (noise() * del2Len);
         g.sign = noise() >= 0.0 ? 1.0 : -1.0;
         g.readChannel = (noise() >= 0.0) ? 0 : 1;
@@ -158,13 +201,28 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
     const auto* curves = shared.getLiveCurves();
 
     double cnt1 = count1;
-    double cnt2 = count2;
 
-    const double del1Len = std::floor ((p.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
-    const double del2Len = (double) del2L.size();
+    // See the class comment on del1LenState -- glide toward the dial's raw
+    // target rather than snapping straight to it, so cnt1/every grain's
+    // read anchor (both wrapped modulo del1Len just below/further down)
+    // never has the wrap modulus yanked out from under them in one sample.
+    const double targetDel1Len = std::floor ((p.bufferLenMs / (del1MaxSeconds * 1000.0)) * (double) del1L.size());
+    del1LenState += (targetDel1Len - del1LenState) * del1LenSmoothCoeff;
+    const double del1Len = del1LenState;
     cnt1 = wrapValue (cnt1, 0.0, del1Len);
 
+    // In singleBufferDualFeedback mode Bank 2 shares del1 entirely: same
+    // buffer, same active length, same (already-wrapped) write head -- see
+    // the class comment in GrainVoiceEngine.h. Aliasing here means every
+    // "del2Len"/"cnt2" reference in Bank 2's loop below (unchanged from the
+    // two-buffer design) transparently means del1Len/cnt1 instead.
+    double cnt2 = singleBufferDualFeedback ? cnt1 : count2;
+    const double del2Len = singleBufferDualFeedback ? del1Len : (double) del2L.size();
+    const std::vector<double>& bank2SrcL = singleBufferDualFeedback ? del1L : del2L;
+    const std::vector<double>& bank2SrcR = singleBufferDualFeedback ? del1R : del2R;
+
     const double readSpan = p.readScatter * del1Len;
+    const double predelaySamples = mstosamps (p.predelayMs);
 
     // ---- grain duration refresh on window param change ----
     const double meanWindowSamps = mstosamps (p.meanWindowMs);
@@ -204,7 +262,7 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
             const auto& srcBuf = (g.readChannel == 0) ? del1L : del1R;
             const double pos = wrapValue (cnt1 - g.read, 0.0, del1Len);
             const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del1Len);
-            double au = peekLinear (srcBuf, readPos);
+            double au = peekLinear (srcBuf, readPos, del1Len);
 
             // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
             const double yf = g.b0 * au + g.z1;
@@ -271,8 +329,8 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
             g.age = 0.0;
             g.rate = 1.0 + noise() * p.jitter;
             g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
-            const double rawRead1 = juce::jmax (5.0, std::abs (noise() * readSpan));
-            g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len);
+            const double rawRead1 = juce::jmax (minSpawnRead (readSpan), std::abs (noise() * readSpan));
+            g.read = clampReadAgainstWriteHead (rawRead1, g.dur, g.rate, del1Len, predelaySamples);
             g.sign = noise() >= 0.0 ? 1.0 : -1.0;
             g.readChannel = (noise() >= 0.0) ? 0 : 1;
             g.writeChannel = chooseWriteChannel (g.readChannel, p.dispersion);
@@ -299,10 +357,10 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
 
         if ((int) gi < activeVoices2)
         {
-            const auto& srcBuf = (g.readChannel == 0) ? del2L : del2R;
+            const auto& srcBuf = (g.readChannel == 0) ? bank2SrcL : bank2SrcR;
             const double pos = wrapValue (cnt2 - g.read, 0.0, del2Len);
             const double readPos = wrapValue (pos + g.age * g.rate, 0.0, del2Len);
-            double au = peekLinear (srcBuf, readPos);
+            double au = peekLinear (srcBuf, readPos, del2Len);
 
             // ---- per-grain TDF-II lowpass (coeffs frozen at spawn) ----
             const double yf2 = g.b0 * au + g.z1;
@@ -339,8 +397,8 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
             g.age = 0.0;
             g.rate = 1.0 + noise() * p.jitter;
             g.dur  = mstosamps (p.meanWindowMs + noise() * p.windowRangeMs);
-            const double rawRead2 = juce::jmax (5.0, std::abs (noise() * del2Len));
-            g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len);
+            const double rawRead2 = juce::jmax (minSpawnRead (del2Len), std::abs (noise() * del2Len));
+            g.read = clampReadAgainstWriteHead (rawRead2, g.dur, g.rate, del2Len, predelaySamples);
             g.sign = noise() >= 0.0 ? 1.0 : -1.0;
             g.readChannel = (noise() >= 0.0) ? 0 : 1;
             g.writeChannel = chooseWriteChannel (g.readChannel, p.dispersion);
@@ -374,19 +432,71 @@ void GrainVoiceEngine::processSample (double inputL, double inputR, const GrainR
     aud2L = dcAud2L.process (aud2L / std::sqrt (juce::jmax (gain2L, 1.0e-4)));
     aud2R = dcAud2R.process (aud2R / std::sqrt (juce::jmax (gain2R, 1.0e-4)));
 
-    outputL = aud2L * 2.0;
-    outputR = aud2R * 2.0;
+    // Safety soft-clip -- dividing by sqrt(gain) normalizes correctly for
+    // grains that sum INCOHERENTLY (like noise, where N contributions add
+    // up as sqrt(N)), but a short buffer packed with many largeish grains
+    // can instead read heavily overlapping/near-identical delayed copies
+    // of a sustained tone, which sum closer to LINEARLY (N, not sqrt(N)).
+    // That gap lets a coherent tone overshoot the normalization by roughly
+    // sqrt(activeVoices) -- confirmed empirically (a 0.3-amplitude 110Hz
+    // tone through a 429ms buffer / 287ms grains / 50 voices produced
+    // peaks over 1.7, and fed back through fb1/fb2 that never settled to
+    // a steady level). tanh clamps that overshoot at its source, right
+    // where it's about to feed back into the buffer AND become aud2's
+    // audible output, without touching well-behaved (already near-unity)
+    // signals -- tanh(x) ~= x for |x| well under 1.
+    //
+    // TRIED replacing this with a threshold-gated gain-reduction limiter
+    // (instant attack/~50ms release, only engaging above 0.95) -- made
+    // things WORSE: tanh's continuous, always-on gentle compression (even
+    // for in-range signals) was quietly damping the feedback loop's
+    // overall energy every single sample; a threshold-gated limiter does
+    // NOTHING below its threshold, so the loop could build up more energy
+    // per cycle than before, producing bigger peaks and a louder stored
+    // buffer (visibly bigger waveform) once the limiter did engage.
+    // Reverted -- tanh's constant, if imperfect, damping is load-bearing.
+    aud1L = std::tanh (aud1L);
+    aud1R = std::tanh (aud1R);
+    aud2L = std::tanh (aud2L);
+    aud2R = std::tanh (aud2R);
 
-    pokeWrite (del1L, cnt1, dcWrite1L.process (inputL + p.fb * aud1L));
-    pokeWrite (del1R, cnt1, dcWrite1R.process (inputR + p.fb * aud1R));
-    pokeWrite (del2L, cnt2, dcWrite2L.process (p.fb * (aud1L + aud2L)));
-    pokeWrite (del2R, cnt2, dcWrite2R.process (p.fb * (aud1R + aud2R)));
+    // The x2 output makeup gain below predates this tanh (inherited from
+    // the original gen~ patch, tuned back when aud2 alone was assumed to
+    // sit comfortably under unity) -- 2*tanh(x) reaches up to 2.0, not
+    // 1.0, so that x2 was UNDOING the ceiling this tanh was just meant to
+    // guarantee, for the one signal (the actual output) that most needed
+    // it. Clip again after the x2 so the signal actually handed back to
+    // the host stays within (-1, 1).
+    outputL = std::tanh (aud2L * 2.0);
+    outputR = std::tanh (aud2R * 2.0);
+
+    // singleBufferDualFeedback: Bank 2's own output feeds back into the
+    // SAME del1 write, scaled by its own fb2 -- rather than a separate
+    // del2 write. fb2ContribL/R is 0 for lateEngine (fb2 unset/unread),
+    // so this collapses exactly to the original del1 write when the flag
+    // is off.
+    const double fb2ContribL = singleBufferDualFeedback ? p.fb2 * aud2L : 0.0;
+    const double fb2ContribR = singleBufferDualFeedback ? p.fb2 * aud2R : 0.0;
+    pokeWrite (del1L, cnt1, dcWrite1L.process (inputL + p.fb * aud1L + fb2ContribL));
+    pokeWrite (del1R, cnt1, dcWrite1R.process (inputR + p.fb * aud1R + fb2ContribR));
+
+    if (! singleBufferDualFeedback)
+    {
+        pokeWrite (del2L, cnt2, dcWrite2L.process (p.fb * (aud1L + aud2L)));
+        pokeWrite (del2R, cnt2, dcWrite2R.process (p.fb * (aud1R + aud2R)));
+    }
 
     cnt1 += 1.0;
     cnt1 = wrapValue (cnt1, 0.0, del1Len);
     count1 = cnt1;
 
-    cnt2 += 1.0;
-    cnt2 = wrapValue (cnt2, 0.0, del2Len);
-    count2 = cnt2;
+    // count2 has no independent meaning in singleBufferDualFeedback mode
+    // (Bank 2 already tracks cnt1 via the alias above) -- left untouched
+    // (frozen at 0 from prepare()) rather than advanced a second time.
+    if (! singleBufferDualFeedback)
+    {
+        cnt2 += 1.0;
+        cnt2 = wrapValue (cnt2, 0.0, del2Len);
+        count2 = cnt2;
+    }
 }
